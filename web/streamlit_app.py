@@ -9,7 +9,12 @@ import streamlit as st
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000").rstrip("/")
+# Prefer Streamlit secrets in cloud, then env var, then a sane hosted default
+API_BASE = (
+    (st.secrets.get("API_BASE") if hasattr(st, "secrets") else None)
+    or os.getenv("API_BASE")
+    or "https://capstone-project-api-jg3n.onrender.com"
+).rstrip("/")
 
 
 def _read_text(path: Path) -> str:
@@ -68,7 +73,8 @@ def _append_task(layer: str, text: str) -> bool:
 def _api_get(path: str) -> tuple[int, dict | str]:
     import requests
     try:
-        headers = {"X-API-Key": os.getenv("DEMO_API_KEY", "demo_key_123")}
+        secret_key = (st.secrets.get("DEMO_API_KEY") if hasattr(st, "secrets") else None)
+        headers = {"X-API-Key": secret_key or os.getenv("DEMO_API_KEY", "demo_key_123")}
         r = requests.get(f"{API_BASE}{path}", timeout=5, headers=headers)
         ctype = r.headers.get("content-type", "")
         if "json" in ctype:
@@ -81,7 +87,8 @@ def _api_get(path: str) -> tuple[int, dict | str]:
 def _api_post(path: str, body: dict, timeout: int = 15) -> tuple[int, dict | str]:
     import requests
     try:
-        headers = {"X-API-Key": os.getenv("DEMO_API_KEY", "demo_key_123")}
+        secret_key = (st.secrets.get("DEMO_API_KEY") if hasattr(st, "secrets") else None)
+        headers = {"X-API-Key": secret_key or os.getenv("DEMO_API_KEY", "demo_key_123")}
         r = requests.post(f"{API_BASE}{path}", json=body, timeout=timeout, headers=headers)
         ctype = r.headers.get("content-type", "")
         if "json" in ctype:

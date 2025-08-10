@@ -301,6 +301,32 @@ def page_tools():
     else:
         st.info("Endpoint not available.")
 
+    st.divider()
+    st.subheader("Ingest Files to Memory (RAG)")
+    uploaded = st.file_uploader("Upload one or more files", type=[
+        "md","txt","json","csv","yaml","yml","html","pdf","docx","png","jpg","jpeg","bmp","tiff"
+    ], accept_multiple_files=True)
+    src = st.text_input("Source tag (optional)", value="ui-upload")
+    if uploaded and st.button("Ingest", type="primary"):
+        import requests
+        try:
+            secret_key = (st.secrets.get("DEMO_API_KEY") if hasattr(st, "secrets") else None)
+            headers = {"X-API-Key": secret_key or os.getenv("DEMO_API_KEY", "demo_key_123")}
+            sess_llm_key = st.session_state.get("LLM_KEY")
+            files = []
+            for f in uploaded:
+                files.append(("files", (f.name, f.getvalue(), "application/octet-stream")))
+            data = {"source": src}
+            resp = requests.post(f"{API_BASE}/ingest/files", headers=headers, files=files, data=data, timeout=180)
+            if resp.ok:
+                st.success(f"Ingested {resp.json().get('stored',0)} files; errors={resp.json().get('errors',0)}")
+                st.json(resp.json())
+            else:
+                st.error(f"Ingest failed: {resp.status_code}")
+                st.text(resp.text)
+        except Exception as e:
+            st.error(str(e))
+
 
 def main():
     st.set_page_config(page_title="Agent Demo UI", layout="wide")

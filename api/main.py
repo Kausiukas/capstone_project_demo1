@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import requests
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -372,5 +372,72 @@ def preview_batch(body: BatchBody, _: None = Depends(require_api_key)) -> Dict[s
 @app.get("/")
 def root() -> Dict[str, Any]:
     return {"service": "capstone-demo-api", "status": "ok"}
+
+
+# ---------------------------
+# Ingestion utilities
+# ---------------------------
+
+def _extract_text_from_bytes(content: bytes, filename: str) -> str:
+    name = (filename or "").lower()
+    try:
+        if name.endswith(('.md', '.txt', '.json', '.csv', '.log', '.yaml', '.yml', '.py', '.js', '.ts', '.html', '.htm')):
+            return content.decode('utf-8', errors='ignore')
+        if name.endswith('.pdf'):
+            from io import BytesIO
+            from pdfminer.high_level import extract_text
+            return extract_text(BytesIO(content)) or ""
+        if name.endswith('.docx'):
+            from io import BytesIO
+            import docx
+            doc = docx.Document(BytesIO(content))
+            return "\n".join([p.text for p in doc.paragraphs])
+        if name.endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')):
+            try:
+                import pytesseract  # optional if available
+                from PIL import Image
+                from io import BytesIO
+                img = Image.open(BytesIO(content))
+                return pytesseract.image_to_string(img) or ""
+            except Exception:
+                return ""
+    except Exception:
+        return ""
+    # Fallback
+    return content.decode('utf-8', errors='ignore')
+
+
+class IngestResponse(BaseModel):
+    stored: int
+    errors: int
+    details: List[Dict[str, Any]]
+
+
+@app.post("/ingest/files", response_model=IngestResponse)
+async def ingest_files(
+    files: List[UploadFile] = File(...),
+    source: Optional[str] = Form(None),
+    _: None = Depends(require_api_key),
+    llm_key: Optional[str] = Depends(get_llm_key),
+):
+    stored = 0
+    errs = 0
+    details: List[Dict[str, Any]] = []
+    for uf in files:
+        try:
+            data = await uf.read()
+            text = _extract_text_from_bytes(data, uf.filename or "file")
+            if not text.strip():
+                details.append({"file": uf.filename, "ok": False, "reason": "empty"})
+                errs += 1
+                continue
+            body = StoreBody(user_input=f"upload:{uf.filename} {source or ''}", response=text)
+            memory_store(body, None, llm_key)  # reuse in-process
+            details.append({"file": uf.filename, "ok": True, "chars": len(text)})
+            stored += 1
+        except Exception as e:
+            errs += 1
+            details.append({"file": uf.filename, "ok": False, "error": str(e)})
+    return IngestResponse(stored=stored, errors=errs, details=details)
 
 

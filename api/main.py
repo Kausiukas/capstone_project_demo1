@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import requests
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -99,6 +100,18 @@ MEMORY_PATH = Path(os.getenv("MEMORY_PATH", "./memory_store.json")).resolve()
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 
+# Provider switch: "ollama" or default "openai"
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+OLLAMA_BASE = os.getenv("OLLAMA_BASE", "http://ollama:11434").rstrip("/")
+OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "llama3.2:3b")
+OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "mxbai-embed-large")
+EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))
+
+
+def get_llm_key(x_llm_key: Optional[str] = Header(None)) -> Optional[str]:
+    """Optional per-request LLM key override provided by the caller via header 'X-LLM-Key'."""
+    return x_llm_key
+
 
 def _ensure_memory_file() -> None:
     if not MEMORY_PATH.exists():
@@ -117,16 +130,40 @@ def _save_memory(data: Dict[str, Any]) -> None:
     MEMORY_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
-def _get_openai_client() -> Optional[OpenAI]:
-    api_key = os.getenv("OPENAI_API_KEY")
+def _get_openai_client(override_key: Optional[str] = None) -> Optional[OpenAI]:
+    api_key = override_key or os.getenv("OPENAI_API_KEY")
     if not api_key or OpenAI is None:
         return None
     return OpenAI(api_key=api_key)
 
 
-def _embed_texts(client: OpenAI, texts: List[str]) -> List[List[float]]:
+def _ollama_post(path: str, payload: Dict[str, Any], timeout: int = 120) -> Dict[str, Any]:
+    url = f"{OLLAMA_BASE}{path}"
+    r = requests.post(url, json=payload, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def _embed_texts_openai(client: OpenAI, texts: List[str]) -> List[List[float]]:
     res = client.embeddings.create(model=EMBED_MODEL, input=texts)
     return [d.embedding for d in res.data]
+
+
+def _embed_texts_ollama(texts: List[str]) -> List[List[float]]:
+    vectors: List[List[float]] = []
+    for t in texts:
+        data = _ollama_post(
+            "/api/embeddings",
+            {"model": OLLAMA_EMBED_MODEL, "prompt": t},
+            timeout=300,
+        )
+        # Ollama returns {"embedding": [...]}
+        vec = data.get("embedding") or data.get("embeddings")
+        if isinstance(vec, list):
+            vectors.append(vec)
+        else:
+            vectors.append([0.0] * EMBED_DIM)
+    return vectors
 
 
 def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
@@ -138,12 +175,23 @@ def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / denom)
 
 
-def _retrieve(client: OpenAI, query: str, k: int = 5) -> List[Dict[str, Any]]:
+def _embed_texts(client: Optional[OpenAI], texts: List[str]) -> List[List[float]]:
+    if LLM_PROVIDER == "ollama":
+        return _embed_texts_ollama(texts)
+    if client is None:
+        return []
+    return _embed_texts_openai(client, texts)
+
+
+def _retrieve(client: Optional[OpenAI], query: str, k: int = 5) -> List[Dict[str, Any]]:
     mem = _load_memory()
     items: List[Dict[str, Any]] = mem.get("items", [])
     if not items:
         return []
-    q_emb = np.array(_embed_texts(client, [query])[0], dtype=np.float32)
+    embs = _embed_texts(client, [query])
+    if not embs:
+        return []
+    q_emb = np.array(embs[0], dtype=np.float32)
     scored: List[Tuple[float, Dict[str, Any]]] = []
     for item in items:
         emb = np.array(item.get("embedding", []), dtype=np.float32)
@@ -158,8 +206,18 @@ class GenerateBody(BaseModel):
 
 
 @app.post("/tools/llm/generate")
-def llm_generate(body: GenerateBody, _: None = Depends(require_api_key)) -> Dict[str, Any]:
-    client = _get_openai_client()
+def llm_generate(body: GenerateBody, _: None = Depends(require_api_key), llm_key: Optional[str] = Depends(get_llm_key)) -> Dict[str, Any]:
+    if LLM_PROVIDER == "ollama":
+        try:
+            data = _ollama_post(
+                "/api/generate",
+                {"model": OLLAMA_CHAT_MODEL, "prompt": body.prompt, "stream": False},
+                timeout=600,
+            )
+            return {"response": (data.get("response") or "").strip()}
+        except Exception as e:
+            return {"response": f"[ollama error] {e}"}
+    client = _get_openai_client(llm_key)
     if client is None:
         return {"response": f"[mock] You said: {body.prompt}"}
     msg = [
@@ -179,12 +237,9 @@ class ChatMessage(BaseModel):
 
 
 @app.post("/chat/message")
-def chat_message(body: ChatMessage, _: None = Depends(require_api_key)) -> Dict[str, Any]:
-    client = _get_openai_client()
-    if client is None:
-        return {"answer": f"[mock] LLM answer to: {body.message}"}
-
-    # Retrieve
+def chat_message(body: ChatMessage, _: None = Depends(require_api_key), llm_key: Optional[str] = Depends(get_llm_key)) -> Dict[str, Any]:
+    # Retrieve (provider-agnostic embeddings)
+    client = _get_openai_client(llm_key) if LLM_PROVIDER != "ollama" else None
     contexts = _retrieve(client, body.message, k=max(1, min(10, body.top_k)))
     docs = "\n\n".join([f"[Doc {i+1}]\n" + (c.get("text") or "") for i, c in enumerate(contexts)])
 
@@ -196,6 +251,28 @@ def chat_message(body: ChatMessage, _: None = Depends(require_api_key)) -> Dict[
         f"User question:\n{body.message}\n\n"
         f"Retrieved context:\n{docs if docs else '(no context)'}"
     )
+
+    if LLM_PROVIDER == "ollama":
+        try:
+            data = _ollama_post(
+                "/api/generate",
+                {
+                    "model": OLLAMA_CHAT_MODEL,
+                    "prompt": system + "\n\n" + user_msg,
+                    "stream": False,
+                    "options": {"temperature": 0.3},
+                },
+                timeout=600,
+            )
+            answer = (data.get("response") or "").strip()
+            return {"answer": answer, "used_docs": len(contexts)}
+        except Exception as e:
+            return {"answer": f"[ollama error] {e}"}
+
+    # OpenAI path
+    client = _get_openai_client(llm_key)
+    if client is None:
+        return {"answer": f"[mock] LLM answer to: {body.message}"}
     res = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
@@ -225,37 +302,23 @@ class StoreBody(BaseModel):
 
 
 @app.post("/memory/store")
-def memory_store(body: StoreBody, __: None = Depends(require_api_key)) -> Dict[str, Any]:
-    client = _get_openai_client()
-    if client is None:
-        # Still store raw text without embeddings for future runs
-        mem = _load_memory()
-        mem.setdefault("items", []).append(
-            {
-                "id": f"m_{int(time.time()*1000)}",
-                "text": (body.user_input or "") + "\n" + (body.response or ""),
-                "embedding": [],
-                "ts": int(time.time()),
-            }
-        )
-        _save_memory(mem)
-        return {"stored": True, "embedded": False}
-
+def memory_store(body: StoreBody, __: None = Depends(require_api_key), llm_key: Optional[str] = Depends(get_llm_key)) -> Dict[str, Any]:
     text = (body.user_input or "").strip() + "\n" + (body.response or "").strip()
-    vec = _embed_texts(client, [text])[0]
+    client = _get_openai_client(llm_key) if LLM_PROVIDER != "ollama" else None
+    vecs = _embed_texts(client, [text])
+    embedded = bool(vecs)
+    vec = vecs[0] if embedded else []
     mem = _load_memory()
     mem.setdefault("items", []).append(
         {"id": f"m_{int(time.time()*1000)}", "text": text, "embedding": vec, "ts": int(time.time())}
     )
     _save_memory(mem)
-    return {"stored": True, "embedded": True}
+    return {"stored": True, "embedded": embedded}
 
 
 @app.get("/memory/query")
-def memory_query(q: str, k: int = 5, _: None = Depends(require_api_key)) -> Dict[str, Any]:
-    client = _get_openai_client()
-    if client is None:
-        return {"snippets": [{"preview": f"[mock] result for '{q}' #{i+1}"} for i in range(k)]}
+def memory_query(q: str, k: int = 5, _: None = Depends(require_api_key), llm_key: Optional[str] = Depends(get_llm_key)) -> Dict[str, Any]:
+    client = _get_openai_client(llm_key) if LLM_PROVIDER != "ollama" else None
     items = _retrieve(client, q, k=max(1, min(20, k)))
     return {"snippets": [{"preview": it.get("text", "")[:800]} for it in items]}
 

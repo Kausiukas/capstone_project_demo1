@@ -75,6 +75,9 @@ def _api_get(path: str) -> tuple[int, dict | str]:
     try:
         secret_key = (st.secrets.get("DEMO_API_KEY") if hasattr(st, "secrets") else None)
         headers = {"X-API-Key": secret_key or os.getenv("DEMO_API_KEY", "demo_key_123")}
+        sess_llm_key = st.session_state.get("LLM_KEY")
+        if sess_llm_key:
+            headers["X-LLM-Key"] = sess_llm_key
         r = requests.get(f"{API_BASE}{path}", timeout=5, headers=headers)
         ctype = r.headers.get("content-type", "")
         if "json" in ctype:
@@ -89,6 +92,9 @@ def _api_post(path: str, body: dict, timeout: int = 15) -> tuple[int, dict | str
     try:
         secret_key = (st.secrets.get("DEMO_API_KEY") if hasattr(st, "secrets") else None)
         headers = {"X-API-Key": secret_key or os.getenv("DEMO_API_KEY", "demo_key_123")}
+        sess_llm_key = st.session_state.get("LLM_KEY")
+        if sess_llm_key:
+            headers["X-LLM-Key"] = sess_llm_key
         r = requests.post(f"{API_BASE}{path}", json=body, timeout=timeout, headers=headers)
         ctype = r.headers.get("content-type", "")
         if "json" in ctype:
@@ -301,6 +307,20 @@ def main():
     with st.sidebar:
         st.title("Agent Demo UI")
         st.caption(f"API_BASE: {API_BASE}")
+        st.divider()
+        st.subheader("LLM Key (optional)")
+        current_key = st.session_state.get("LLM_KEY", "")
+        new_key = st.text_input("X-LLM-Key header", value=current_key, type="password")
+        colk1, colk2 = st.columns(2)
+        with colk1:
+            if st.button("Save Key"):
+                st.session_state["LLM_KEY"] = new_key
+                st.success("Saved")
+        with colk2:
+            if st.button("Clear Key"):
+                st.session_state.pop("LLM_KEY", None)
+                st.info("Cleared")
+        st.divider()
         page = st.radio("Navigate", ["Chat", "Reports", "Suggestions", "Layers", "Mesh", "Health", "Tools/APIs"], index=0)
 
     if page == "Chat":

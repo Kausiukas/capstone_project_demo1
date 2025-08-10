@@ -3,9 +3,9 @@ services:
     name: capstone-api
     env: python
     plan: free
-    rootDir: api
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    # Use repo root as working dir and reference api/ explicitly for robustness
+    buildCommand: pip install --upgrade pip && pip install -r api/requirements.txt
+    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
     autoDeploy: true
     healthCheckPath: /
     envVars:

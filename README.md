@@ -1,122 +1,106 @@
-# LangFlow Connect MVP - Integrated Dashboard
+# 7-Agent Layers Demo — Self Development Session (LLM + RAG + Memory)
 
-## 🎯 Project Overview
+This repository hosts a focused demonstration of a 7-layer agent architecture with an emphasis on self-development sessions, retrieval-augmented generation (RAG), and long-term memory.
 
-This is a **Capstone Project** demonstration of the LangFlow Connect MCP (Model Context Protocol) server with integrated Content Preview and Performance Monitoring systems.
+Repository: [Kausiukas/capstone_project_demo1](https://github.com/Kausiukas/capstone_project_demo1)
 
-## 🚀 Quick Start
+## Quick Start
 
 ```bash
 # Install dependencies
 pip install -r requirements.txt
 
-# Run MCP server
-python src/mcp_server_enhanced_tools.py
-
-# Run integrated dashboard
-streamlit run streamlit_app_integrated.py
+# Run the self-development session demo
+python scripts/self_dev_session.py
 ```
-## PostgreSQL + pgvector (Docker)
 
-Prereqs:
-- Docker Desktop on Windows with WSL2 backend enabled
+Artifacts and logs are stored under `results/` (e.g., `results/chat_sessions/`).
 
-Start/stop:
-- Start DB: `docker compose up -d`
-- Stop DB: `docker compose down`
-- Logs: `docker compose logs -f db`
-- Verify: `python scripts/verify_pgvector.py`
+## Repository Layout
 
-Automation:
+- `7_agent_layers/`
+  - `LVL_1` … `LVL_7`: Each layer includes `layer#.md`, `runbook.md`, `tasklist.md`, `mesh.md`, and `health_checks.md` (plus layer-specific docs).
+  - Cross-layer docs: `file_map.md`, `mesh_map.md`, `directory_requirements.md`, `readme.txt`.
+- `scripts/`
+  - `self_dev_session.py`: Orchestrates a guided self-development iteration across layers.
+  - `health_probe.py`: Lightweight environment/health probe.
+- `results/`
+  - `chat_sessions/.gitkeep`, `llm_suggestions/.gitkeep`: Output directories used by runs.
 
+## Layers Overview
+
+The detailed specification for each layer lives alongside the code/docs in `7_agent_layers/LVL_#/`. Use the `layer#.md` documents for the authoritative design and behaviors.
+
+- Layer 1 — Foundation & Tasks
+  - Spec: `7_agent_layers/LVL_1/layer1.md`
+  - Companion docs: `tasklist.md`, `runbook.md`, `mesh.md`, `health_checks.md`.
+- Layer 2 — Tools & Interfaces
+  - Spec: `7_agent_layers/LVL_2/layer2.md`
+  - Companion docs as above.
+- Layer 3 — Planning & Goals
+  - Spec: `7_agent_layers/LVL_3/layer3.md`
+  - Goals: `7_agent_layers/LVL_3/goals.md`, `7_agent_layers/LVL_3/goals.yaml`.
+- Layer 4 — Orchestration & Mesh
+  - Spec: `7_agent_layers/LVL_4/layer4.md`.
+- Layer 5 — Self-Development & Learning
+  - Spec: `7_agent_layers/LVL_5/layer5.md`, `7_agent_layers/LVL_5/self_dev_session.md` (if present).
+- Layer 6 — Memory & Knowledge Management
+  - Spec: `7_agent_layers/LVL_6/layer6.md`.
+- Layer 7 — Governance, Reporting & Health
+  - Spec: `7_agent_layers/LVL_7/layer7.md`.
+
+Complementary cross-layer maps:
+- `7_agent_layers/file_map.md` — file-level catalog
+- `7_agent_layers/mesh_map.md` — interfaces and data flows
+- `7_agent_layers/directory_requirements.md` — required structure
+
+## Self-Development Session
+
+`scripts/self_dev_session.py` drives a structured iteration where the agent reflects on goals, evaluates current capabilities, proposes improvements, and records outcomes. Expected outputs include session logs and updated artifacts in `results/`.
+
+Run:
 ```bash
-# Ensure DB is up, wait for readiness, ensure pgvector, and print DATABASE_URL
-python scripts/ensure_pgvector.py --timeout 120
-
-# Optionally set it in the current process and see the value
-python scripts/ensure_pgvector.py --set-env
-
-# Then run tests that need the DB
-pytest -q tests/phase1/test_pgvector_basic.py
+python scripts/self_dev_session.py
 ```
 
-Details:
-- Data persists in the `pgdata` Docker volume
-- Config via `.env` (defaults provided in docs); connection string `DATABASE_URL`
-- Default port mapping `5432:5432`. If port is in use, change left side to `5433:5432` and set `DATABASE_URL=postgresql://app:app@localhost:5433/appdb`
+You can run multiple sessions and compare outputs to track capability growth over time.
 
-Troubleshooting:
-- Port 5432 in use → change mapping and `DATABASE_URL`
-- WSL high memory → `wsl --shutdown` in PowerShell to reclaim RAM
-- Resource limits → Docker Desktop → Settings → Resources
+## LLM + RAG
 
+The demo is designed to integrate with an LLM backend and a vector store for retrieval-augmented generation:
 
-## 🛠 Features
+- Embeddings + vector store: pluggable; typical setups use PostgreSQL + pgvector
+- Retriever: semantic search over long-term memory
+- Generator: LLM completes tasks using retrieved context
 
-### Core Tools
-- **5 Core Tools**: ping, read_file, list_files, get_system_status, analyze_code
-- **Universal File Access**: Local, GitHub, and HTTP file support
-- **Web Interface**: Streamlit-based unified dashboard
-- **API Access**: RESTful API for programmatic access
+Configure provider credentials and endpoints via environment variables as appropriate for your LLM stack (e.g., `OPENAI_API_KEY` or compatible provider keys).
 
-### Content Preview System
-- **Syntax Highlighting**: Support for 20+ programming languages
-- **Markdown Rendering**: Full markdown to HTML conversion
-- **Image Preview**: Base64 encoding for inline display
-- **Batch Processing**: Preview multiple files simultaneously
-- **File Analysis**: Automatic type detection and capabilities
+## Long-term Memory
 
-### Performance Monitoring
-- **Real-time Metrics**: Response times, success rates, error counts
-- **System Monitoring**: CPU, memory, disk usage tracking
-- **Performance Alerts**: Automated alerting for issues
-- **Health Monitoring**: Comprehensive system health checks
-- **Tool-specific Metrics**: Individual tool performance tracking
+Long-term memory is backed by a vector store. Common configuration:
 
-## 📊 Dashboard Sections
+- Database connection string via `DATABASE_URL`, e.g.
+  - `postgresql://USER:PASS@HOST:PORT/DBNAME`
+- Vector extension: `pgvector` (if using PostgreSQL)
 
-1. **🏠 Dashboard** - Overview and quick actions
-2. **🛠️ Tool Testing** - Interactive tool execution
-3. **👁️ Content Preview** - File preview and analysis
-4. **📊 Performance Monitoring** - Real-time metrics and alerts
-5. **🗺️ Topology** - Live ports/processes/env and DB/pgvector status
-5. **📚 API Docs** - Complete API documentation
-6. **🔧 System Status** - System health and configuration
+While this repository focuses on the layered demo and session flow, it is compatible with a pgvector-backed memory if you supply a reachable database and embeddings provider.
 
-## 🔧 Configuration
+## Connect to a Dockerized API
 
-The dashboard automatically connects to the deployed API at:
-`https://capstone-project-api-jg3n.onrender.com`
+If you run a separate, containerized API that provides LLM/RAG services:
 
-You can change the API URL in the sidebar configuration.
+1. Start your API as usual (e.g., `docker compose up -d`).
+2. Ensure it’s reachable from your machine (e.g., `http://localhost:8000`).
+3. Provide its base URL to your scripts or environment, e.g.:
+   - Set `API_URL` (or equivalent expected by your stack):
+     ```bash
+     set API_URL=http://localhost:8000
+     ```
+   - Or pass as an argument if your wrapper supports it.
 
-## 🧰 Utilities
+If your API exposes vector operations, also set `DATABASE_URL` to point at your vector DB instance.
 
-- `scripts/ports_status.py`: list listening ports and owning processes; helpful for resolving conflicts (8000/8501/5433)
-- `scripts/find_free_port.py`: find an available local TCP port in a range
-- `scripts/topology_probe.py`: query the API `/admin/topology` endpoint and pretty-print results
-- `scripts/warmup_api.py`: warm up key endpoints (`/health`, `/performance/*`, `/db/*`) to prime caches/DB
-
-Examples:
-
-```bash
-python scripts/ports_status.py --common
-python scripts/find_free_port.py --start 8000 --end 8100
-python scripts/topology_probe.py --api http://127.0.0.1:8000 --key demo_key_123
-python scripts/warmup_api.py --api http://127.0.0.1:8000 --key demo_key_123
-```
-
-## 📄 License
+## License
 
 MIT License
 
-## 🎯 Capstone Project Status
-
-✅ **Complete** - All systems integrated and functional
-- Core MCP tools operational
-- Content Preview System active
-- Performance Monitoring active
-- Unified dashboard deployed
-- Universal file access working
-- Real-time metrics collection
-- Comprehensive error handling

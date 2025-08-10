@@ -26,7 +26,7 @@ python-multipart>=0.0.6
 Pillow>=10.0.0
 websockets==12.0
 
-# Database (PostgreSQL) and env loading
-psycopg[binary]==3.1.19
-asyncpg==0.29.0
+# Database (PostgreSQL) and env loading (Py 3.13 compatible)
+psycopg[binary]==3.2.9
+asyncpg==0.30.0
 python-dotenv>=1.0.1

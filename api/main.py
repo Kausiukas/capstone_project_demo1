@@ -298,12 +298,20 @@ def run_session(_: RunSessionBody, __: None = Depends(require_api_key)) -> Dict[
 # Memory store/query (JSON + OpenAI embeddings)
 class StoreBody(BaseModel):
     user_input: str
-    response: str
+    response: Optional[str] = None
+    response_b64: Optional[str] = None
 
 
 @app.post("/memory/store")
 def memory_store(body: StoreBody, __: None = Depends(require_api_key), llm_key: Optional[str] = Depends(get_llm_key)) -> Dict[str, Any]:
-    text = (body.user_input or "").strip() + "\n" + (body.response or "").strip()
+    raw_resp = body.response or ""
+    if (not raw_resp) and body.response_b64:
+        try:
+            import base64
+            raw_resp = base64.b64decode(body.response_b64).decode("utf-8", errors="ignore")
+        except Exception:
+            raw_resp = ""
+    text = (body.user_input or "").strip() + "\n" + raw_resp.strip()
     client = _get_openai_client(llm_key) if LLM_PROVIDER != "ollama" else None
     vecs = _embed_texts(client, [text])
     embedded = bool(vecs)

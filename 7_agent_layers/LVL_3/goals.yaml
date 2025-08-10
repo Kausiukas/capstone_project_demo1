@@ -1,0 +1,60 @@
+objectives:
+  revenue:
+    title: Revenue generation
+    description: Generate qualified demand to finance further development
+    weight: 1.5
+    time_horizon: weekly
+    key_results:
+      - name: MQLs per week
+        metric: mqls_per_week
+        target: 10
+        direction: up
+        weight: 1.0
+      - name: Booked demos per week
+        metric: demos_per_week
+        target: 3
+        direction: up
+        weight: 1.0
+    constraints:
+      - type: budget
+        max: 100.0
+
+  learning:
+    title: Iterative learning & development
+    description: Improve reliability, recall and dev velocity continuously
+    weight: 1.2
+    time_horizon: weekly
+    key_results:
+      - name: Test pass rate
+        metric: test_pass_rate
+        target: 0.9
+        direction: up
+        weight: 1.0
+      - name: Recall@5
+        metric: recall_at_5
+        target: 0.7
+        direction: up
+        weight: 1.0
+    constraints: []
+
+  commercialization:
+    title: Commercialization readiness
+    description: Raise layer readiness and ops quality for product launch
+    weight: 1.0
+    time_horizon: weekly
+    key_results:
+      - name: Layer readiness score
+        metric: readiness_score
+        target: 0.7
+        direction: up
+        weight: 1.0
+      - name: p95 tools latency (ms)
+        metric: p95_tools_latency_ms
+        target: 500
+        direction: down
+        weight: 1.0
+    constraints:
+      - type: deny_tag
+        tag: unsafe
+
+

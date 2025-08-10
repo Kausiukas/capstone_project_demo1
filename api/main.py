@@ -1,9 +1,19 @@
 import os
-from typing import Any, Dict, List, Optional
+import json
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+try:
+    # OpenAI SDK v1
+    from openai import OpenAI  # type: ignore
+except Exception:  # pragma: no cover
+    OpenAI = None  # type: ignore
 
 
 API_KEY_ENV = os.getenv("API_KEY", "demo_key_123")
@@ -24,7 +34,9 @@ app.add_middleware(
 )
 
 
-# Health and performance
+# ---------------------------
+# Basic health and metrics
+# ---------------------------
 @app.get("/health")
 def health(_: None = Depends(require_api_key)) -> Dict[str, Any]:
     return {"status": "ok"}
@@ -79,14 +91,84 @@ def tools_call(body: ToolCall, _: None = Depends(require_api_key)) -> Dict[str, 
     return {"content": [{"type": "text", "text": f"Executed {body.name} with {body.arguments}"}]}
 
 
-# LLM endpoints (mock)
+# ---------------------------
+# Simple RAG + LLM wiring
+# ---------------------------
+
+MEMORY_PATH = Path(os.getenv("MEMORY_PATH", "./memory_store.json")).resolve()
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
+
+
+def _ensure_memory_file() -> None:
+    if not MEMORY_PATH.exists():
+        MEMORY_PATH.write_text(json.dumps({"items": []}), encoding="utf-8")
+
+
+def _load_memory() -> Dict[str, Any]:
+    _ensure_memory_file()
+    try:
+        return json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {"items": []}
+
+
+def _save_memory(data: Dict[str, Any]) -> None:
+    MEMORY_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def _get_openai_client() -> Optional[OpenAI]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key or OpenAI is None:
+        return None
+    return OpenAI(api_key=api_key)
+
+
+def _embed_texts(client: OpenAI, texts: List[str]) -> List[List[float]]:
+    res = client.embeddings.create(model=EMBED_MODEL, input=texts)
+    return [d.embedding for d in res.data]
+
+
+def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    if a.size == 0 or b.size == 0:
+        return 0.0
+    denom = (np.linalg.norm(a) * np.linalg.norm(b))
+    if denom == 0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+
+def _retrieve(client: OpenAI, query: str, k: int = 5) -> List[Dict[str, Any]]:
+    mem = _load_memory()
+    items: List[Dict[str, Any]] = mem.get("items", [])
+    if not items:
+        return []
+    q_emb = np.array(_embed_texts(client, [query])[0], dtype=np.float32)
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    for item in items:
+        emb = np.array(item.get("embedding", []), dtype=np.float32)
+        scored.append((_cosine_sim(q_emb, emb), item))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [it for _, it in scored[:k]]
+
+
+# LLM raw generate
 class GenerateBody(BaseModel):
     prompt: str
 
 
 @app.post("/tools/llm/generate")
 def llm_generate(body: GenerateBody, _: None = Depends(require_api_key)) -> Dict[str, Any]:
-    return {"response": f"[mock] You said: {body.prompt}"}
+    client = _get_openai_client()
+    if client is None:
+        return {"response": f"[mock] You said: {body.prompt}"}
+    msg = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": body.prompt},
+    ]
+    res = client.chat.completions.create(model=CHAT_MODEL, messages=msg)
+    text = (res.choices[0].message.content or "").strip()
+    return {"response": text}
 
 
 # Chat and session
@@ -98,7 +180,29 @@ class ChatMessage(BaseModel):
 
 @app.post("/chat/message")
 def chat_message(body: ChatMessage, _: None = Depends(require_api_key)) -> Dict[str, Any]:
-    return {"answer": f"[mock] LLM answer to: {body.message}"}
+    client = _get_openai_client()
+    if client is None:
+        return {"answer": f"[mock] LLM answer to: {body.message}"}
+
+    # Retrieve
+    contexts = _retrieve(client, body.message, k=max(1, min(10, body.top_k)))
+    docs = "\n\n".join([f"[Doc {i+1}]\n" + (c.get("text") or "") for i, c in enumerate(contexts)])
+
+    system = (
+        "You are the agent brain with access to retrieved context from prior sessions. "
+        "Use the provided documents if relevant. If not enough information is present, say so briefly."
+    )
+    user_msg = (
+        f"User question:\n{body.message}\n\n"
+        f"Retrieved context:\n{docs if docs else '(no context)'}"
+    )
+    res = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
+        temperature=0.3,
+    )
+    answer = (res.choices[0].message.content or "").strip()
+    return {"answer": answer, "used_docs": len(contexts)}
 
 
 class RunSessionBody(BaseModel):
@@ -114,20 +218,46 @@ def run_session(_: RunSessionBody, __: None = Depends(require_api_key)) -> Dict[
     return {"returncode": 0, "stdout": "[mock] session completed", "stderr": ""}
 
 
-# Memory (mock)
+# Memory store/query (JSON + OpenAI embeddings)
 class StoreBody(BaseModel):
     user_input: str
     response: str
 
 
 @app.post("/memory/store")
-def memory_store(_: StoreBody, __: None = Depends(require_api_key)) -> Dict[str, Any]:
-    return {"stored": True}
+def memory_store(body: StoreBody, __: None = Depends(require_api_key)) -> Dict[str, Any]:
+    client = _get_openai_client()
+    if client is None:
+        # Still store raw text without embeddings for future runs
+        mem = _load_memory()
+        mem.setdefault("items", []).append(
+            {
+                "id": f"m_{int(time.time()*1000)}",
+                "text": (body.user_input or "") + "\n" + (body.response or ""),
+                "embedding": [],
+                "ts": int(time.time()),
+            }
+        )
+        _save_memory(mem)
+        return {"stored": True, "embedded": False}
+
+    text = (body.user_input or "").strip() + "\n" + (body.response or "").strip()
+    vec = _embed_texts(client, [text])[0]
+    mem = _load_memory()
+    mem.setdefault("items", []).append(
+        {"id": f"m_{int(time.time()*1000)}", "text": text, "embedding": vec, "ts": int(time.time())}
+    )
+    _save_memory(mem)
+    return {"stored": True, "embedded": True}
 
 
 @app.get("/memory/query")
 def memory_query(q: str, k: int = 5, _: None = Depends(require_api_key)) -> Dict[str, Any]:
-    return {"snippets": [{"preview": f"[mock] result for '{q}' #{i+1}"} for i in range(k)]}
+    client = _get_openai_client()
+    if client is None:
+        return {"snippets": [{"preview": f"[mock] result for '{q}' #{i+1}"} for i in range(k)]}
+    items = _retrieve(client, q, k=max(1, min(20, k)))
+    return {"snippets": [{"preview": it.get("text", "")[:800]} for it in items]}
 
 
 # Content preview (mock)

@@ -31,22 +31,22 @@ Artifacts and logs are stored under `results/` (e.g., `results/chat_sessions/`).
 
 The detailed specification for each layer lives alongside the code/docs in `7_agent_layers/LVL_#/`. Use the `layer#.md` documents for the authoritative design and behaviors.
 
-- Layer 1 — Foundation & Tasks
+- Layer 1 — Human Interface
   - Spec: `7_agent_layers/LVL_1/layer1.md`
   - Companion docs: `tasklist.md`, `runbook.md`, `mesh.md`, `health_checks.md`.
-- Layer 2 — Tools & Interfaces
+- Layer 2 — Information Gathering & Context
   - Spec: `7_agent_layers/LVL_2/layer2.md`
   - Companion docs as above.
-- Layer 3 — Planning & Goals
+- Layer 3 — Structure, Goals & Behaviors
   - Spec: `7_agent_layers/LVL_3/layer3.md`
   - Goals: `7_agent_layers/LVL_3/goals.md`, `7_agent_layers/LVL_3/goals.yaml`.
-- Layer 4 — Orchestration & Mesh
+- Layer 4 — Agent Brain (Reasoning & Planning)
   - Spec: `7_agent_layers/LVL_4/layer4.md`.
-- Layer 5 — Self-Development & Learning
+- Layer 5 — Tools & API Layer
   - Spec: `7_agent_layers/LVL_5/layer5.md`, `7_agent_layers/LVL_5/self_dev_session.md` (if present).
-- Layer 6 — Memory & Knowledge Management
+- Layer 6 — Memory & Feedback
   - Spec: `7_agent_layers/LVL_6/layer6.md`.
-- Layer 7 — Governance, Reporting & Health
+- Layer 7 — Infrastructure, Scaling & Security
   - Spec: `7_agent_layers/LVL_7/layer7.md`.
 
 Complementary cross-layer maps:
@@ -93,9 +93,9 @@ If you run a separate, containerized API that provides LLM/RAG services:
 2. Ensure it’s reachable from your machine (e.g., `http://localhost:8000`).
 3. Provide its base URL to your scripts or environment, e.g.:
    - Set `API_URL` (or equivalent expected by your stack):
-     ```bash
+```bash
      set API_URL=http://localhost:8000
-     ```
+```
    - Or pass as an argument if your wrapper supports it.
 
 If your API exposes vector operations, also set `DATABASE_URL` to point at your vector DB instance.

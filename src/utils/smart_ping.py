@@ -128,6 +128,11 @@ def _resolve_ips(host: str) -> List[str]:
                 continue
     except Exception:
         pass
+    # Stabilize ordering for signature consistency
+    try:
+        ips.sort()
+    except Exception:
+        pass
     return ips
 
 
@@ -207,6 +212,15 @@ def probe_target(
     head_url = base + "/health"
     head_status, head_headers = _http_head(head_url, headers=headers, timeout=timeout)
 
+    # Cloudflare data
+    cf_ray = head_headers.get("cf-ray")
+    cf_colo = None
+    if cf_ray and "-" in cf_ray:
+        try:
+            cf_colo = cf_ray.split("-")[-1]
+        except Exception:
+            cf_colo = None
+
     # Decide egress: if Cloudflare seen and non-52x from origin on GET → origin reached
     get_status: int = 0
     get_body: Any = None
@@ -214,6 +228,23 @@ def probe_target(
         get_status, get_body = _http_get_json(head_url, headers=headers, timeout=timeout)
 
     signature = _build_signature(host, ips, tls_info, head_headers)
+
+    # Inferences
+    server_hdr = (head_headers.get("server") or "").lower()
+    edge_reached = ("cloudflare" in server_hdr) or (
+        (getattr(tls_info, "subject", "") or "").find("trycloudflare.com") >= 0
+    )
+    origin_reached = False
+    origin_reason = ""
+    if head_status == 405:
+        origin_reached = True
+        origin_reason = "HEAD not allowed on /health (likely origin behavior)"
+    if include_health_body and isinstance(get_body, (dict, list, str)) and get_status:
+        # 2xx/4xx from origin with JSON/text body implies origin processed the request
+        if 200 <= get_status < 600 and get_status not in (520, 521, 522, 523, 524):
+            origin_reached = True
+            if not origin_reason:
+                origin_reason = f"GET /health returned {get_status}"
 
     result: Dict[str, Any] = {
         "target_url": target_url,
@@ -237,6 +268,15 @@ def probe_target(
         "http_health": {
             "status": get_status,
             "body": get_body if include_health_body else None,
+        },
+        "cloudflare": {
+            "cf_ray": cf_ray,
+            "colo": cf_colo,
+        },
+        "inferences": {
+            "edge_reached": edge_reached,
+            "origin_reached": origin_reached,
+            "reason": origin_reason or None,
         },
         "signature": signature,
     }

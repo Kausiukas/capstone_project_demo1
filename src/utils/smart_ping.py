@@ -279,6 +279,7 @@ def probe_target(
             "status": ident_status,
             "body": ident_body if isinstance(ident_body, (dict, list, str)) else None,
         },
+        "ping_tool": None,
         "cloudflare": {
             "cf_ray": cf_ray,
             "colo": cf_colo,
@@ -290,6 +291,17 @@ def probe_target(
         },
         "signature": signature,
     }
+
+    # Try ping tool for consolidated data (instance + llm + memory + endpoints)
+    try:
+        payload = {"name": "ping", "arguments": {}}
+        r = requests.post(base + "/api/v1/tools/call", json=payload, headers=headers, timeout=timeout)
+        if r.ok and (r.headers.get("content-type", "").lower().find("json") >= 0):
+            result["ping_tool"] = r.json()
+        else:
+            result["ping_tool"] = {"status": r.status_code, "text": r.text[:200]}
+    except Exception as e:
+        result["ping_tool"] = {"error": str(e)}
     return result
 
 

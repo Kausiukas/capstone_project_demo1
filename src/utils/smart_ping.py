@@ -207,7 +207,7 @@ def probe_target(
     # Use conservative UA to match requests default
     headers.setdefault("User-Agent", requests.utils.default_user_agent())
 
-    # HEAD probe on /health if path unspecified; else HEAD on provided path
+    # HEAD probe on /health
     base = f"{parsed.scheme}://{parsed.netloc}"
     head_url = base + "/health"
     head_status, head_headers = _http_head(head_url, headers=headers, timeout=timeout)
@@ -226,6 +226,12 @@ def probe_target(
     get_body: Any = None
     if include_health_body:
         get_status, get_body = _http_get_json(head_url, headers=headers, timeout=timeout)
+
+    # Try identity endpoint for explicit origin identity
+    ident_status: int = 0
+    ident_body: Any = None
+    ident_url = base + "/identity"
+    ident_status, ident_body = _http_get_json(ident_url, headers=headers, timeout=timeout)
 
     signature = _build_signature(host, ips, tls_info, head_headers)
 
@@ -268,6 +274,10 @@ def probe_target(
         "http_health": {
             "status": get_status,
             "body": get_body if include_health_body else None,
+        },
+        "http_identity": {
+            "status": ident_status,
+            "body": ident_body if isinstance(ident_body, (dict, list, str)) else None,
         },
         "cloudflare": {
             "cf_ray": cf_ray,

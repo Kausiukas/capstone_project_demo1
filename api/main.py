@@ -170,7 +170,15 @@ class ToolCall(BaseModel):
 @app.post("/api/v1/tools/call")
 def tools_call(body: ToolCall, _: None = Depends(require_api_key)) -> Dict[str, Any]:
     if body.name == "ping":
-        return {"content": [{"type": "text", "text": "pong"}], "instance": build_identity()}
+        # Include lightweight components so UI can show instance + LLM + Memory + Endpoints
+        components = _components_snapshot()
+        return {
+            "content": [{"type": "text", "text": "pong"}],
+            "instance": build_identity(),
+            "llm": components.get("llm", {}),
+            "memory": components.get("memory", {}),
+            "endpoints": components.get("endpoints", {}),
+        }
     return {"content": [{"type": "text", "text": f"Executed {body.name} with {body.arguments}"}]}
 
 
@@ -630,6 +638,10 @@ def preview_batch(body: BatchBody, _: None = Depends(require_api_key)) -> Dict[s
 
 @app.get("/status/components")
 def status_components(_: None = Depends(require_api_key)) -> Dict[str, Any]:
+    return _components_snapshot()
+
+
+def _components_snapshot() -> Dict[str, Any]:
     components: Dict[str, Any] = {}
     # API basics
     components["api"] = {

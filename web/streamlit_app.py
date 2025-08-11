@@ -298,7 +298,8 @@ def page_health():
         st.error("API unavailable")
 
     st.subheader("/health")
-    st.code(json.dumps(stat.get("health") if isinstance(stat.get("health"), dict) else {"raw": stat.get("health")}, indent=2))
+    h = stat.get("health") if isinstance(stat.get("health"), dict) else {"raw": stat.get("health")}
+    st.code(json.dumps(h, indent=2))
 
     code_m, data_m = _api_get("/performance/metrics")
     st.subheader("/performance/metrics")

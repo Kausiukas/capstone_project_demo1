@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 import json
 import time
@@ -104,6 +104,20 @@ def _api_post(path: str, body: dict, timeout: int = 15) -> tuple[int, dict | str
         return 0, str(e)
 
 
+def _api_status() -> dict:
+    """Check API reachability and readiness.
+    Returns: { api_ok: bool, ready_ok: bool, health: any, ready: any }
+    """
+    status: dict = {"api_ok": False, "ready_ok": False}
+    hc, h = _api_get("/health")
+    status["health"] = h
+    status["api_ok"] = bool(hc and hc >= 200 and hc < 300)
+    rc, r = _api_get("/status/ready")
+    status["ready"] = r
+    status["ready_ok"] = bool(rc and rc >= 200 and rc < 300 and isinstance(r, dict) and r.get("ready"))
+    return status
+
+
 def page_chat():
     st.header("Chat & Session Runner")
     prompt = st.text_input("Ask the agent", value="What is L4 and how does it work?")
@@ -118,9 +132,10 @@ def page_chat():
             else:
                 st.warning("Backend unavailable; showing placeholder response.")
                 st.write(f"Echo: {prompt}")
+    st.caption("Tip: Use Streamed Chat to prevent tunnel timeouts on long answers.")
     with col2:
         if st.button("Run 2-min Self-Dev Session", use_container_width=True):
-            with st.status("Running self_dev_session (2 min)…", expanded=True):
+            with st.status("Running self_dev_session (2 min)ā€¦", expanded=True):
                 # Delegate to backend endpoint so UI works remotely too
                 code, data = _api_post(
                     "/admin/run_session",
@@ -157,6 +172,39 @@ def page_chat():
             if code >= 200 and isinstance(hist, dict):
                 st.code(json.dumps(hist, indent=2))
 
+    st.divider()
+    st.subheader("Streamed Chat (keeps tunnel alive)")
+    streamed_q = st.text_input("Prompt (streamed)", value="Explain Layer 4 deeply")
+    if st.button("Send streamed", type="primary"):
+        import requests
+        try:
+            secret_key = (st.secrets.get("DEMO_API_KEY") if hasattr(st, "secrets") else None)
+            headers = {"X-API-Key": secret_key or os.getenv("DEMO_API_KEY", "demo_key_123")}
+            sess_llm_key = st.session_state.get("LLM_KEY")
+            if sess_llm_key:
+                headers["X-LLM-Key"] = sess_llm_key
+            resp = requests.post(
+                f"{API_BASE}/chat/stream",
+                json={"session_id": "default", "message": streamed_q, "top_k": 5},
+                headers=headers,
+                stream=True,
+                timeout=600,
+            )
+            resp.raise_for_status()
+            out = ""
+            ph = st.empty()
+            for chunk in resp.iter_content(chunk_size=None):
+                if not chunk:
+                    continue
+                try:
+                    text = chunk.decode("utf-8", errors="ignore")
+                except Exception:
+                    continue
+                out += text
+                ph.write(out)
+        except Exception as e:
+            st.error(str(e))
+
 
 def page_reports():
     st.header("Self-Dev Reports")
@@ -177,7 +225,7 @@ def page_suggestions():
         if st.button("Run suggestions job", type="primary"):
             code, data = _api_post("/selfdev/suggestions/run", {"max_files": 12})
             if code >= 200 and isinstance(data, dict):
-                st.success(f"Generated {data.get('count', 0)} suggestions → {data.get('path','')}")
+                st.success(f"Generated {data.get('count', 0)} suggestions ā†’ {data.get('path','')}")
             else:
                 st.error(f"Failed to run suggestions job: {code}")
     p = _latest_suggestions_file()
@@ -239,9 +287,19 @@ def page_mesh():
 
 def page_health():
     st.header("Health & Metrics")
-    code_h, data_h = _api_get("/health")
+
+    # Overall status indicator
+    stat = _api_status()
+    if stat.get("ready_ok"):
+        st.success("API ready")
+    elif stat.get("api_ok"):
+        st.warning("API reachable, warming up…")
+    else:
+        st.error("API unavailable")
+
     st.subheader("/health")
-    st.code(json.dumps(data_h if isinstance(data_h, dict) else {"raw": data_h}, indent=2))
+    st.code(json.dumps(stat.get("health") if isinstance(stat.get("health"), dict) else {"raw": stat.get("health")}, indent=2))
+
     code_m, data_m = _api_get("/performance/metrics")
     st.subheader("/performance/metrics")
     st.code(json.dumps(data_m if isinstance(data_m, dict) else {"raw": data_m}, indent=2))
@@ -263,8 +321,26 @@ def page_health():
         else:
             st.error(f"Generate failed: {code}")
 
+    st.divider()
+    st.subheader("Readiness & Warmup")
+    colw1, colw2 = st.columns(2)
+    with colw1:
+        if st.button("Check readiness"):
+            st.json(_api_status())
+    with colw2:
+        if st.button("Warm model", type="primary"):
+            c, d = _api_post("/admin/warmup", {}, timeout=180)
+            if c >= 200 and isinstance(d, dict):
+                if d.get("ready"):
+                    st.success(f"Warmed. embed_ms={d.get('embed_ms')}, generate_ms={d.get('generate_ms')}")
+                else:
+                    st.warning(d)
+            else:
+                st.error(f"Warmup failed: {c}")
+
+    st.divider()
     if st.button("Run local health_probe.py"):
-        with st.status("Running health_probe.py…", expanded=False):
+        with st.status("Running health_probe.pyā€¦", expanded=False):
             try:
                 proc = subprocess.run([sys.executable, str(PROJECT_ROOT / "scripts" / "health_probe.py")],
                                       cwd=str(PROJECT_ROOT), capture_output=True, text=True, timeout=60)
@@ -367,5 +443,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 

@@ -347,7 +347,11 @@ def page_health():
         grid = st.columns(2)
         with grid[0]:
             st.markdown("**API status**")
-            st.json({"api_base": API_BASE, "tunnel_url": tunnel_url or "(none)", **comp.get("api", {})})
+            st.json({
+                "api_base": API_BASE,
+                "tunnel_url": tunnel_url or "(none)",
+                "instance": comp.get("api", {}),
+            })
             st.markdown("**LLM status**")
             st.json(comp.get("llm", {}))
         with grid[1]:

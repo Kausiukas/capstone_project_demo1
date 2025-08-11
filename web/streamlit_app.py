@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 import streamlit as st
+from src.utils.smart_ping import probe_target
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -411,6 +412,28 @@ def page_tools():
             st.json(data.get("instance", {}))
         else:
             st.error(f"Ping failed: {code}")
+
+    st.divider()
+    st.subheader("Smart Ping (low-noise instance fingerprint)")
+    tgt = st.text_input("Target URL", value=API_BASE, key="smart_ping_url")
+    include_body = st.checkbox("Include /health body", value=False, key="smart_ping_body")
+    if st.button("Run Smart Ping", key="run_smart_ping"):
+        secret_key = (st.secrets.get("DEMO_API_KEY") if hasattr(st, "secrets") else None)
+        headers_key = secret_key or os.getenv("DEMO_API_KEY", "demo_key_123")
+        llm_key = st.session_state.get("LLM_KEY")
+        try:
+            data = probe_target(tgt, api_key=headers_key, llm_key=llm_key, include_health_body=include_body)
+            colA, colB, colC = st.columns(3)
+            with colA:
+                st.metric("Resolved IPs", ", ".join(data.get("resolved_ips") or []) or "(none)")
+            with colB:
+                st.metric("TLS/ALPN", (data.get("tls") or {}).get("alpn") or "-")
+            with colC:
+                sig = (data.get("signature") or "")
+                st.metric("Signature", (sig[7:19] + "…") if sig.startswith("sha256:") else sig)
+            st.code(json.dumps(data, indent=2))
+        except Exception as e:
+            st.error(str(e))
 
     st.divider()
     st.subheader("Ingest Files to Memory (RAG)")

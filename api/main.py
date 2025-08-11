@@ -533,6 +533,40 @@ def preview_batch(body: BatchBody, _: None = Depends(require_api_key)) -> Dict[s
     return {"successful_previews": len(results), "total_files": len(body.file_paths), "results": results}
 
 
+# ---------------------------
+# Component status snapshot
+# ---------------------------
+
+@app.get("/status/components")
+def status_components(_: None = Depends(require_api_key)) -> Dict[str, Any]:
+    components: Dict[str, Any] = {}
+    # API basics
+    components["api"] = {"service": "capstone-demo-api", "llm_provider": LLM_PROVIDER}
+    # Endpoints availability
+    components["endpoints"] = {
+        "status_ready": True,
+        "admin_warmup": True,
+        "chat_stream": True,
+        "ingest_files": True,
+    }
+    # Memory
+    try:
+        mem = _load_memory()
+        components["memory"] = {"path": str(MEMORY_PATH), "items": len(mem.get("items", []))}
+    except Exception as e:
+        components["memory"] = {"error": str(e)}
+    # LLM provider quick signal
+    if LLM_PROVIDER == "ollama":
+        try:
+            _ = _ollama_get("/api/tags", timeout=5)
+            components["llm"] = {"ollama": "up", "base": OLLAMA_BASE, "chat_model": OLLAMA_CHAT_MODEL, "embed_model": OLLAMA_EMBED_MODEL}
+        except Exception as e:
+            components["llm"] = {"ollama": "down", "error": str(e)}
+    else:
+        components["llm"] = {"openai_key": bool(os.getenv("OPENAI_API_KEY")), "chat_model": CHAT_MODEL, "embed_model": EMBED_MODEL}
+    return components
+
+
 @app.get("/")
 def root() -> Dict[str, Any]:
     return {"service": "capstone-demo-api", "status": "ok"}

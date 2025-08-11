@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 import socket
 from typing import Any, Dict, List, Optional, Tuple
+import hashlib
 
 import numpy as np
 import requests
@@ -37,6 +38,21 @@ app.add_middleware(
 )
 
 
+# Identity headers middleware
+@app.middleware("http")
+async def add_identity_headers(request, call_next):
+    response = await call_next(request)
+    try:
+        response.headers["X-Api-Hostname"] = HOSTNAME
+        response.headers["X-Api-Started-At"] = str(STARTED_AT)
+        response.headers["X-Api-Image-Tag"] = IMAGE_TAG
+        response.headers["X-Api-Commit"] = COMMIT_SHA
+        response.headers["X-Api-Instance-Id"] = INSTANCE_ID
+    except Exception:
+        pass
+    return response
+
+
 # ---------------------------
 # Basic health and metrics
 # ---------------------------
@@ -50,6 +66,7 @@ def health(_: None = Depends(require_api_key)) -> Dict[str, Any]:
             "image_tag": IMAGE_TAG,
             "commit_sha": COMMIT_SHA,
             "build_time": BUILD_TIME,
+            "instance_id": INSTANCE_ID,
         },
     }
 
@@ -107,6 +124,7 @@ def tools_call(body: ToolCall, _: None = Depends(require_api_key)) -> Dict[str, 
                 "image_tag": IMAGE_TAG,
                 "commit_sha": COMMIT_SHA,
                 "build_time": BUILD_TIME,
+                "instance_id": INSTANCE_ID,
             },
         }
     return {"content": [{"type": "text", "text": f"Executed {body.name} with {body.arguments}"}]}
@@ -133,6 +151,9 @@ HOSTNAME = os.getenv("HOSTNAME") or socket.gethostname()
 IMAGE_TAG = os.getenv("IMAGE_TAG", "local")
 COMMIT_SHA = os.getenv("COMMIT_SHA", "dev")
 BUILD_TIME = os.getenv("BUILD_TIME", "")
+INSTANCE_ID = hashlib.sha1(
+    f"{HOSTNAME}|{STARTED_AT}|{IMAGE_TAG}|{COMMIT_SHA}|{BUILD_TIME}".encode("utf-8", errors="ignore")
+).hexdigest()[:16]
 
 
 def get_llm_key(x_llm_key: Optional[str] = Header(None)) -> Optional[str]:

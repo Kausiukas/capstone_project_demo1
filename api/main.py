@@ -2,6 +2,7 @@
 import json
 import time
 from pathlib import Path
+import socket
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -107,6 +108,13 @@ OLLAMA_BASE = os.getenv("OLLAMA_BASE", "http://ollama:11434").rstrip("/")
 OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "llama3.2:3b")
 OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "mxbai-embed-large")
 EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))
+
+# Process identity
+STARTED_AT = int(time.time())
+HOSTNAME = os.getenv("HOSTNAME") or socket.gethostname()
+IMAGE_TAG = os.getenv("IMAGE_TAG", "local")
+COMMIT_SHA = os.getenv("COMMIT_SHA", "dev")
+BUILD_TIME = os.getenv("BUILD_TIME", "")
 
 
 def get_llm_key(x_llm_key: Optional[str] = Header(None)) -> Optional[str]:
@@ -541,7 +549,15 @@ def preview_batch(body: BatchBody, _: None = Depends(require_api_key)) -> Dict[s
 def status_components(_: None = Depends(require_api_key)) -> Dict[str, Any]:
     components: Dict[str, Any] = {}
     # API basics
-    components["api"] = {"service": "capstone-demo-api", "llm_provider": LLM_PROVIDER}
+    components["api"] = {
+        "service": "capstone-demo-api",
+        "llm_provider": LLM_PROVIDER,
+        "hostname": HOSTNAME,
+        "started_at": STARTED_AT,
+        "image_tag": IMAGE_TAG,
+        "commit_sha": COMMIT_SHA,
+        "build_time": BUILD_TIME,
+    }
     # Endpoints availability
     components["endpoints"] = {
         "status_ready": True,

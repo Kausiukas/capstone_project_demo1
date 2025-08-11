@@ -339,6 +339,26 @@ def page_health():
                 st.error(f"Warmup failed: {c}")
 
     st.divider()
+    st.subheader("Components Snapshot")
+    c, comp = _api_get("/status/components")
+    if c >= 200 and isinstance(comp, dict):
+        # Derive tunnel and API base info
+        tunnel_url = (st.secrets.get("API_BASE") if hasattr(st, "secrets") else os.getenv("API_BASE", ""))
+        grid = st.columns(2)
+        with grid[0]:
+            st.markdown("**API status**")
+            st.json({"api_base": API_BASE, "tunnel_url": tunnel_url or "(none)", **comp.get("api", {})})
+            st.markdown("**LLM status**")
+            st.json(comp.get("llm", {}))
+        with grid[1]:
+            st.markdown("**RAG / Memory**")
+            st.json(comp.get("memory", {}))
+            st.markdown("**Endpoints**")
+            st.json(comp.get("endpoints", {}))
+    else:
+        st.info("/status/components not available (older API build?)")
+
+    st.divider()
     if st.button("Run local health_probe.py"):
         with st.status("Running health_probe.pyā€¦", expanded=False):
             try:

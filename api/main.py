@@ -42,7 +42,16 @@ app.add_middleware(
 # ---------------------------
 @app.get("/health")
 def health(_: None = Depends(require_api_key)) -> Dict[str, Any]:
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "instance": {
+            "hostname": HOSTNAME,
+            "started_at": STARTED_AT,
+            "image_tag": IMAGE_TAG,
+            "commit_sha": COMMIT_SHA,
+            "build_time": BUILD_TIME,
+        },
+    }
 
 
 @app.get("/performance/metrics")
@@ -90,7 +99,16 @@ class ToolCall(BaseModel):
 @app.post("/api/v1/tools/call")
 def tools_call(body: ToolCall, _: None = Depends(require_api_key)) -> Dict[str, Any]:
     if body.name == "ping":
-        return {"content": [{"type": "text", "text": "pong"}]}
+        return {
+            "content": [{"type": "text", "text": "pong"}],
+            "instance": {
+                "hostname": HOSTNAME,
+                "started_at": STARTED_AT,
+                "image_tag": IMAGE_TAG,
+                "commit_sha": COMMIT_SHA,
+                "build_time": BUILD_TIME,
+            },
+        }
     return {"content": [{"type": "text", "text": f"Executed {body.name} with {body.arguments}"}]}
 
 

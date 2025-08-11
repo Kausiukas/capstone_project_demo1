@@ -1,4 +1,4 @@
-import os
+﻿import os
 import json
 import time
 from pathlib import Path
@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import requests
 from fastapi import Depends, FastAPI, Header, HTTPException, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -140,6 +141,12 @@ def _get_openai_client(override_key: Optional[str] = None) -> Optional[OpenAI]:
 def _ollama_post(path: str, payload: Dict[str, Any], timeout: int = 120) -> Dict[str, Any]:
     url = f"{OLLAMA_BASE}{path}"
     r = requests.post(url, json=payload, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+def _ollama_get(path: str, timeout: int = 10) -> Dict[str, Any]:
+    url = f"{OLLAMA_BASE}{path}"
+    r = requests.get(url, timeout=timeout)
     r.raise_for_status()
     return r.json()
 
@@ -282,6 +289,95 @@ def chat_message(body: ChatMessage, _: None = Depends(require_api_key), llm_key:
     return {"answer": answer, "used_docs": len(contexts)}
 
 
+@app.post("/chat/stream")
+def chat_stream(body: ChatMessage, _: None = Depends(require_api_key), llm_key: Optional[str] = Depends(get_llm_key)):
+    """Stream chat answer with periodic keepalives so tunnels/proxies don't time out.
+    Sends small whitespace heartbeats every ~8 seconds and yields partial tokens
+    as available. Client should treat it as text/event-stream or chunked text.
+    """
+    client = _get_openai_client(llm_key) if LLM_PROVIDER != "ollama" else None
+    contexts = _retrieve(client, body.message, k=max(1, min(10, body.top_k)))
+    docs = "\n\n".join([f"[Doc {i+1}]\n" + (c.get("text") or "") for i, c in enumerate(contexts)])
+    system = (
+        "You are the agent brain with access to retrieved context from prior sessions. "
+        "Use the provided documents if relevant. If not enough information is present, say so briefly."
+    )
+    user_msg = (
+        f"User question:\n{body.message}\n\n" f"Retrieved context:\n{docs if docs else '(no context)'}"
+    )
+
+    def _stream_ollama():
+        import datetime
+        last = time.time()
+        try:
+            # Use generate streaming
+            url = f"{OLLAMA_BASE}/api/generate"
+            with requests.post(
+                url,
+                json={
+                    "model": OLLAMA_CHAT_MODEL,
+                    "prompt": system + "\n\n" + user_msg,
+                    "stream": True,
+                    "options": {"temperature": 0.3},
+                },
+                stream=True,
+                timeout=600,
+            ) as r:
+                r.raise_for_status()
+                for line in r.iter_lines(decode_unicode=True):
+                    now = time.time()
+                    if not line:
+                        # emit keepalive every 8s
+                        if now - last > 8:
+                            last = now
+                            yield " \n"
+                        continue
+                    # Ollama streams JSON per line {response: '...', done: bool}
+                    try:
+                        obj = json.loads(line)
+                        chunk = (obj.get("response") or "")
+                        if chunk:
+                            yield chunk
+                            last = now
+                        if obj.get("done"):
+                            break
+                    except Exception:
+                        yield " \n"
+        except Exception as e:
+            yield f"[stream error] {e}"
+
+    def _stream_openai():
+        last = time.time()
+        if client is None:
+            # mock stream with small chunks
+            txt = f"[mock] LLM answer to: {body.message}"
+            for ch in txt:
+                yield ch
+                time.sleep(0.01)
+            return
+        try:
+            stream = client.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
+                temperature=0.3,
+                stream=True,
+            )
+            for ev in stream:
+                now = time.time()
+                if hasattr(ev, "choices") and ev.choices:
+                    delta = ev.choices[0].delta.content or ""
+                    if delta:
+                        yield delta
+                        last = now
+                if now - last > 8:
+                    yield " \n"
+                    last = now
+        except Exception as e:
+            yield f"[stream error] {e}"
+
+    generator = _stream_ollama if LLM_PROVIDER == "ollama" else _stream_openai
+    return StreamingResponse(generator(), media_type="text/plain; charset=utf-8")
+
 class RunSessionBody(BaseModel):
     duration_min: int = 2
     sleep: float = 0.2
@@ -294,6 +390,74 @@ class RunSessionBody(BaseModel):
 def run_session(_: RunSessionBody, __: None = Depends(require_api_key)) -> Dict[str, Any]:
     return {"returncode": 0, "stdout": "[mock] session completed", "stderr": ""}
 
+
+# ---------------------------
+# Readiness + Warmup
+# ---------------------------
+
+class WarmupResult(BaseModel):
+    provider: str
+    embed_ms: Optional[float] = None
+    generate_ms: Optional[float] = None
+    ready: bool = False
+
+
+@app.get("/status/ready")
+def status_ready(_: None = Depends(require_api_key)) -> Dict[str, Any]:
+    ready = False
+    details: Dict[str, Any] = {"provider": LLM_PROVIDER}
+    if LLM_PROVIDER == "ollama":
+        try:
+            _ = _ollama_get("/api/tags", timeout=5)
+            details["ollama"] = "up"
+            ready = True
+        except Exception as e:
+            details["ollama_error"] = str(e)
+            ready = False
+    else:
+        details["has_openai_key"] = bool(os.getenv("OPENAI_API_KEY"))
+        ready = bool(os.getenv("OPENAI_API_KEY"))
+    return {"ready": ready, "details": details}
+
+
+@app.post("/admin/warmup", response_model=WarmupResult)
+def admin_warmup(_: None = Depends(require_api_key), llm_key: Optional[str] = Depends(get_llm_key)) -> WarmupResult:
+    embed_ms: Optional[float] = None
+    generate_ms: Optional[float] = None
+    if LLM_PROVIDER == "ollama":
+        try:
+            t0 = time.time()
+            _ = _ollama_post("/api/embeddings", {"model": OLLAMA_EMBED_MODEL, "prompt": "warmup"}, timeout=180)
+            embed_ms = (time.time() - t0) * 1000.0
+        except Exception:
+            embed_ms = None
+        try:
+            t0 = time.time()
+            _ = _ollama_post("/api/generate", {"model": OLLAMA_CHAT_MODEL, "prompt": "hi", "stream": False}, timeout=300)
+            generate_ms = (time.time() - t0) * 1000.0
+        except Exception:
+            generate_ms = None
+        ready = (embed_ms is not None) and (generate_ms is not None)
+        return WarmupResult(provider=LLM_PROVIDER, embed_ms=embed_ms, generate_ms=generate_ms, ready=ready)
+
+    # OpenAI path
+    client = _get_openai_client(llm_key)
+    if client is None:
+        return WarmupResult(provider=LLM_PROVIDER, embed_ms=None, generate_ms=None, ready=False)
+    try:
+        t0 = time.time()
+        _ = _embed_texts_openai(client, ["warmup text"])
+        embed_ms = (time.time() - t0) * 1000.0
+    except Exception:
+        embed_ms = None
+    try:
+        t0 = time.time()
+        _ = client.chat.completions.create(model=CHAT_MODEL, messages=[{"role": "user", "content": "hi"}])
+        generate_ms = (time.time() - t0) * 1000.0
+    except Exception:
+        generate_ms = None
+    ready = (embed_ms is not None) and (generate_ms is not None)
+    return WarmupResult(provider=LLM_PROVIDER, embed_ms=embed_ms, generate_ms=generate_ms, ready=ready)
 
 # Memory store/query (JSON + OpenAI embeddings)
 class StoreBody(BaseModel):
@@ -439,5 +603,6 @@ async def ingest_files(
             errs += 1
             details.append({"file": uf.filename, "ok": False, "error": str(e)})
     return IngestResponse(stored=stored, errors=errs, details=details)
+
 
 

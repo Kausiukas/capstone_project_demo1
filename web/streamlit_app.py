@@ -403,6 +403,16 @@ def page_tools():
         st.info("Endpoint not available.")
 
     st.divider()
+    st.subheader("Ping API instance")
+    if st.button("Ping", key="ping_api"):
+        code, data = _api_post("/api/v1/tools/call", {"name": "ping", "arguments": {}}, timeout=30)
+        if code >= 200 and isinstance(data, dict):
+            st.success("pong")
+            st.json(data.get("instance", {}))
+        else:
+            st.error(f"Ping failed: {code}")
+
+    st.divider()
     st.subheader("Ingest Files to Memory (RAG)")
     uploaded = st.file_uploader("Upload one or more files", type=[
         "md","txt","json","csv","yaml","yml","html","pdf","docx","png","jpg","jpeg","bmp","tiff"

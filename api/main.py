@@ -5,6 +5,8 @@ from pathlib import Path
 import socket
 from typing import Any, Dict, List, Optional, Tuple
 import hashlib
+import platform
+import json as _json
 
 import numpy as np
 import requests
@@ -56,19 +58,71 @@ async def add_identity_headers(request, call_next):
 # ---------------------------
 # Basic health and metrics
 # ---------------------------
+def _load_identity_from_file() -> Dict[str, Any]:
+    """Optionally load identity from a JSON file specified by IDENTITY_FILE or ./identity.json.
+    Values in this file augment environment-derived identity.
+    """
+    locations = []
+    env_path = os.getenv("IDENTITY_FILE")
+    if env_path:
+        locations.append(Path(env_path))
+    # next to this module
+    locations.append(Path(__file__).resolve().parent / "identity.json")
+    # project root (two levels up from api/main.py)
+    locations.append(Path(__file__).resolve().parents[1] / "identity.json")
+    for p in locations:
+        try:
+            if p.exists():
+                return _json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+    return {}
+
+
+_IDENTITY_FILE_DATA = _load_identity_from_file()
+
+
+def build_identity() -> Dict[str, Any]:
+    """Build a standardized identity object for the API instance.
+
+    Priority order per field: file override → environment → computed defaults.
+    """
+    service = _IDENTITY_FILE_DATA.get("service") or os.getenv("SERVICE_NAME", "capstone-demo-api")
+    version = _IDENTITY_FILE_DATA.get("version") or os.getenv("SERVICE_VERSION", "0.1.0")
+    # Select a human-visible identificator if provided, else use instance hash
+    identificator = (
+        _IDENTITY_FILE_DATA.get("identificator")
+        or os.getenv("API_IDENTIFICATOR")
+        or INSTANCE_ID
+    )
+    identity: Dict[str, Any] = {
+        "service": service,
+        "version": version,
+        "hostname": HOSTNAME,
+        "started_at": STARTED_AT,
+        "image_tag": _IDENTITY_FILE_DATA.get("image_tag") or IMAGE_TAG,
+        "commit_sha": _IDENTITY_FILE_DATA.get("commit_sha") or COMMIT_SHA,
+        "build_time": _IDENTITY_FILE_DATA.get("build_time") or BUILD_TIME,
+        "instance_id": INSTANCE_ID,
+        "identificator": identificator,
+        "python": platform.python_version(),
+        "pid": os.getpid(),
+    }
+    # Allow custom fields from file under "extras"
+    extras = _IDENTITY_FILE_DATA.get("extras")
+    if isinstance(extras, dict):
+        identity["extras"] = extras
+    return identity
+
+
+@app.get("/identity")
+def identity(_: None = Depends(require_api_key)) -> Dict[str, Any]:
+    return build_identity()
+
+
 @app.get("/health")
 def health(_: None = Depends(require_api_key)) -> Dict[str, Any]:
-    return {
-        "status": "ok",
-        "instance": {
-            "hostname": HOSTNAME,
-            "started_at": STARTED_AT,
-            "image_tag": IMAGE_TAG,
-            "commit_sha": COMMIT_SHA,
-            "build_time": BUILD_TIME,
-            "instance_id": INSTANCE_ID,
-        },
-    }
+    return {"status": "ok", "instance": build_identity()}
 
 
 @app.get("/performance/metrics")
@@ -116,17 +170,7 @@ class ToolCall(BaseModel):
 @app.post("/api/v1/tools/call")
 def tools_call(body: ToolCall, _: None = Depends(require_api_key)) -> Dict[str, Any]:
     if body.name == "ping":
-        return {
-            "content": [{"type": "text", "text": "pong"}],
-            "instance": {
-                "hostname": HOSTNAME,
-                "started_at": STARTED_AT,
-                "image_tag": IMAGE_TAG,
-                "commit_sha": COMMIT_SHA,
-                "build_time": BUILD_TIME,
-                "instance_id": INSTANCE_ID,
-            },
-        }
+        return {"content": [{"type": "text", "text": "pong"}], "instance": build_identity()}
     return {"content": [{"type": "text", "text": f"Executed {body.name} with {body.arguments}"}]}
 
 

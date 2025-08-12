@@ -8,10 +8,11 @@ import hashlib
 import platform
 import json as _json
 import asyncio
+from datetime import datetime
 
 import numpy as np
 import requests
-from fastapi import Depends, FastAPI, Header, HTTPException, UploadFile, File, Form
+from fastapi import Depends, FastAPI, Header, HTTPException, UploadFile, File, Form, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -201,52 +202,277 @@ CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 
 # Provider switch: "ollama" or default "openai"
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").strip().lower()
-OLLAMA_BASE = os.getenv("OLLAMA_BASE", "http://ollama:11434").rstrip("/")
+OLLAMA_BASE = os.getenv("OLLAMA_BASE", "http://lfc-ollama:11434").rstrip("/")
 OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "llama3.2:3b")
 OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "mxbai-embed-large")
 EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))
 
-# PostgreSQL memory system
-_memory_system: Optional[MemorySystem] = None
+# Simple PostgreSQL memory system
+import asyncpg
+from typing import List, Dict, Any
+
+# Import Interaction class
+try:
+    from src.layers.memory_system import Interaction
+except ImportError:
+    # Fallback if import fails
+    from dataclasses import dataclass
+    from datetime import datetime
+    
+    @dataclass
+    class Interaction:
+        user_input: str
+        response: str
+        tool_calls: List[Any]
+        metadata: Dict[str, Any]
+        timestamp: datetime
+        source: str = "unknown"
+
+class SimplePostgreSQLMemory:
+    """Simple PostgreSQL memory system for direct database access"""
+    
+    def __init__(self, connection_string: str):
+        self.connection_string = connection_string
+        self._pool = None
+    
+    async def initialize(self):
+        """Initialize connection pool"""
+        try:
+            self._pool = await asyncpg.create_pool(
+                self.connection_string,
+                min_size=1,
+                max_size=5,
+                command_timeout=15
+            )
+            return True
+        except Exception as e:
+            print(f"Failed to initialize PostgreSQL pool: {e}")
+            return False
+    
+    async def query_similar(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
+        """Simple text-based search (fallback when embeddings not available)"""
+        try:
+            if not self._pool:
+                await self.initialize()
+            
+            async with self._pool.acquire() as conn:
+                # Simple text search for now
+                results = await conn.fetch(
+                    """
+                    SELECT id, source, content, created_at 
+                    FROM vector_store 
+                    WHERE content ILIKE $1 OR source ILIKE $1
+                    ORDER BY created_at DESC 
+                    LIMIT $2
+                    """,
+                    f"%{query}%", k
+                )
+                
+                return [
+                    {
+                        "id": str(r["id"]),
+                        "source": r["source"],
+                        "content": r["content"],
+                        "created_at": r["created_at"].isoformat() if r["created_at"] else None
+                    }
+                    for r in results
+                ]
+        except Exception as e:
+            print(f"PostgreSQL query failed: {e}")
+            return []
+    
+    async def get_document_count(self) -> int:
+        """Get total document count"""
+        try:
+            if not self._pool:
+                await self.initialize()
+            
+            async with self._pool.acquire() as conn:
+                return await conn.fetchval("SELECT COUNT(*) FROM vector_store")
+        except Exception as e:
+            print(f"Failed to get document count: {e}")
+            return 0
+    
+    async def get_sample_documents(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """Get sample documents for preview"""
+        try:
+            if not self._pool:
+                await self.initialize()
+            
+            async with self._pool.acquire() as conn:
+                results = await conn.fetch(
+                    """
+                    SELECT id, source, content, created_at 
+                    FROM vector_store 
+                    ORDER BY created_at DESC 
+                    LIMIT $1
+                    """,
+                    limit
+                )
+                
+                return [
+                    {
+                        "id": str(r["id"]),
+                        "source": r["source"],
+                        "content": r["content"][:200] + "..." if len(r["content"]) > 200 else r["content"],
+                        "created_at": r["created_at"].isoformat() if r["created_at"] else None
+                    }
+                    for r in results
+                ]
+        except Exception as e:
+            print(f"Failed to get sample documents: {e}")
+            return []
+    
+    async def store_interaction(self, interaction: Interaction, embedding: List[float]) -> Dict[str, Any]:
+        """Store interaction with embedding in PostgreSQL"""
+        try:
+            if not self._pool:
+                await self.initialize()
+            
+            async with self._pool.acquire() as conn:
+                # Store the interaction in vector_store table
+                await conn.execute(
+                    """
+                    INSERT INTO vector_store (source, content, created_at)
+                    VALUES ($1, $2, $3)
+                    """,
+                    getattr(interaction, 'source', 'unknown'),
+                    f"{interaction.user_input}\n{interaction.response}",
+                    datetime.now()
+                )
+                return {"success": True, "record_id": "stored"}
+        except Exception as e:
+            print(f"Failed to store interaction in PostgreSQL: {e}")
+            return {"success": False, "error": str(e)}
+
+# Global memory system instance
+_simple_memory_system: Optional[SimplePostgreSQLMemory] = None
 _memory_system_lock = asyncio.Lock()
 
-async def _get_memory_system() -> Optional[MemorySystem]:
-    """Get or create PostgreSQL memory system instance with proper async handling"""
-    global _memory_system
-    if not POSTGRES_MEMORY_AVAILABLE:
-        return None
+async def _get_simple_memory_system() -> Optional[SimplePostgreSQLMemory]:
+    """Get or create simple PostgreSQL memory system"""
+    global _simple_memory_system
     
-    if _memory_system is None:
+    if _simple_memory_system is None:
         async with _memory_system_lock:
-            if _memory_system is None:  # Double-check pattern
+            if _simple_memory_system is None:
                 try:
-                    _memory_system = MemorySystem(
-                        connection_string=os.getenv("DATABASE_URL"),
-                        embedding_dimension=EMBED_DIM
+                    _simple_memory_system = SimplePostgreSQLMemory(
+                        connection_string=os.getenv("DATABASE_URL")
                     )
+                    await _simple_memory_system.initialize()
                 except Exception as e:
-                    print(f"Warning: Failed to initialize PostgreSQL memory system: {e}")
+                    print(f"Warning: Failed to initialize simple PostgreSQL memory system: {e}")
                     return None
     
-    return _memory_system
+    return _simple_memory_system
 
-def _get_memory_system_sync() -> Optional[MemorySystem]:
-    """Synchronous wrapper for memory system - for non-async contexts"""
-    global _memory_system
-    if not POSTGRES_MEMORY_AVAILABLE:
-        return None
-    
-    if _memory_system is None:
+def _get_memory_system_sync() -> Optional[SimplePostgreSQLMemory]:
+    """Synchronous wrapper for getting memory system"""
+    try:
+        # Check if we're in an async context
+        import asyncio
         try:
-            _memory_system = MemorySystem(
-                connection_string=os.getenv("DATABASE_URL"),
-                embedding_dimension=EMBED_DIM
-            )
-        except Exception as e:
-            print(f"Warning: Failed to initialize PostgreSQL memory system: {e}")
+            asyncio.get_running_loop()
+            # We're in async context, return None to avoid conflicts
             return None
-    
-    return _memory_system
+        except RuntimeError:
+            # No event loop, safe to create one
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                result = loop.run_until_complete(_get_simple_memory_system())
+                return result
+            finally:
+                loop.close()
+    except Exception as e:
+        print(f"Failed to get memory system synchronously: {e}")
+        return None
+
+# ---------------------------
+# Tool helpers
+# ---------------------------
+async def _list_documents(limit: int = 20) -> Dict[str, Any]:
+    """Return list of documents from PostgreSQL if available, else JSON fallback."""
+    try:
+        mem_system = await _get_simple_memory_system()
+        if mem_system:
+            docs = await mem_system.get_sample_documents(limit=limit)
+            total = await mem_system.get_document_count()
+            return {
+                "success": True,
+                "type": "postgresql_pgvector",
+                "total_documents": total,
+                "documents": docs,
+            }
+    except Exception:
+        # Fall back below
+        pass
+
+    # Fallback to JSON memory file
+    mem = _load_memory()
+    items = mem.get("items", [])
+    documents: List[Dict[str, Any]] = []
+    for idx, item in enumerate(items[:limit]):
+        documents.append(
+            {
+                "id": str(idx + 1),
+                "source": "json_file",
+                "content": (item.get("response") or "")[:200],
+                "created_at": None,
+            }
+        )
+    return {
+        "success": True,
+        "type": "json_file",
+        "total_documents": len(items),
+        "documents": documents,
+    }
+
+async def _handle_chat_tools(message: str) -> Optional[Dict[str, Any]]:
+    """Very lightweight tool router for chat messages.
+
+    Triggers:
+    - Explicit command: !list_docs [limit]
+    - Heuristic: user asks to list/what files/documents present
+    Returns a dict with keys: tool, text, data; or None if no tool is used.
+    """
+    msg = (message or "").lower()
+
+    # Explicit command parsing
+    if msg.startswith("!list_docs") or any(
+        phrase in msg for phrase in [
+            "what files are present",
+            "what documents are present",
+            "what files do we have",
+            "what documents do we have",
+            "list files",
+            "list documents",
+        ]
+    ):
+        # Optional limit parsing for explicit command: !list_docs 50
+        parts = msg.split()
+        limit = 20
+        if len(parts) >= 2 and parts[0] == "!list_docs":
+            try:
+                limit = max(1, min(200, int(parts[1])))
+            except Exception:
+                limit = 20
+
+        data = await _list_documents(limit=limit)
+        docs = data.get("documents", [])
+        lines: List[str] = []
+        for d in docs:
+            lines.append(
+                f"- id {d.get('id')}, source {d.get('source')}, created_at {d.get('created_at')}"
+            )
+        text = (
+            "Here are the documents currently in memory (top "
+            f"{len(docs)}):\n" + ("\n".join(lines) if lines else "(none)")
+        )
+        return {"tool": "list_documents", "text": text, "data": data}
+
+    return None
 
 # Process identity
 STARTED_AT = int(time.time())
@@ -270,21 +496,61 @@ def _ensure_memory_file() -> None:
         MEMORY_PATH.write_text(json.dumps({"items": []}), encoding="utf-8")
 
 
-def _load_memory() -> Dict[str, Any]:
+async def _load_memory_async() -> Dict[str, Any]:
     """Load memory - prefer PostgreSQL, fallback to JSON file"""
     # Try PostgreSQL first
-    mem_system = _get_memory_system_sync()
-    if mem_system:
-        try:
-            # Return PostgreSQL memory info
+    try:
+        mem_system = await _get_simple_memory_system()
+        if mem_system:
+            doc_count = await mem_system.get_document_count()
             return {
                 "type": "postgresql_pgvector",
                 "database_url": os.getenv("DATABASE_URL", "not_set"),
                 "embedding_dimension": EMBED_DIM,
-                "available": True
+                "available": True,
+                "document_count": doc_count
             }
-        except Exception:
-            pass
+    except Exception as e:
+        print(f"PostgreSQL memory system failed: {e}")
+    
+    # Fallback to JSON file
+    _ensure_memory_file()
+    try:
+        return {
+            "type": "json_file",
+            "path": str(MEMORY_PATH),
+            "items": json.loads(MEMORY_PATH.read_text(encoding="utf-8")).get("items", [])
+        }
+    except Exception:
+        return {"type": "json_file", "path": str(MEMORY_PATH), "items": []}
+
+def _load_memory() -> Dict[str, Any]:
+    """Synchronous wrapper for memory loading"""
+    try:
+        # Try to get async result in sync context
+        import asyncio
+        try:
+            # Check if we're already in an event loop
+            loop = asyncio.get_running_loop()
+            # We're in an async context, can't use run_until_complete
+            return {
+                "type": "postgresql_pgvector",
+                "database_url": os.getenv("DATABASE_URL", "not_set"),
+                "embedding_dimension": EMBED_DIM,
+                "available": True,
+                "document_count": 0  # Will be updated by async calls
+            }
+        except RuntimeError:
+            # No event loop running, safe to create one
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                result = loop.run_until_complete(_load_memory_async())
+                return result
+            finally:
+                loop.close()
+    except Exception as e:
+        print(f"Memory loading failed: {e}")
     
     # Fallback to JSON file
     _ensure_memory_file()
@@ -301,13 +567,16 @@ def _load_memory() -> Dict[str, Any]:
 def _save_memory(data: Dict[str, Any]) -> None:
     """Save memory - prefer PostgreSQL, fallback to JSON file"""
     # Try PostgreSQL first
-    mem_system = _get_memory_system_sync()
-    if mem_system:
-        try:
-            # PostgreSQL memory is handled by the MemorySystem class
-            return
-        except Exception:
-            pass
+    try:
+        mem_system = _get_memory_system_sync()
+        if mem_system:
+            try:
+                # PostgreSQL memory is handled by the MemorySystem class
+                return
+            except Exception:
+                pass
+    except Exception:
+        pass
     
     # Fallback to JSON file
     MEMORY_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -427,10 +696,16 @@ class ChatMessage(BaseModel):
 
 @app.post("/chat/message")
 async def chat_message(body: ChatMessage, _: None = Depends(require_api_key), llm_key: Optional[str] = Depends(get_llm_key)) -> Dict[str, Any]:
+    # Tool use: allow explicit or inferred tool invocation
+    tool_reply = await _handle_chat_tools(body.message)
+    if tool_reply is not None:
+        # Return tool result directly, still include used_docs=0 for UX consistency
+        return {"answer": tool_reply["text"], "tool": tool_reply["tool"], "data": tool_reply["data"], "used_docs": 0}
+
     # Try to retrieve context using PostgreSQL memory system first
     contexts = []
     try:
-        mem_system = await _get_memory_system()
+        mem_system = await _get_simple_memory_system()
         if mem_system:
             # Use PostgreSQL memory system
             if LLM_PROVIDER == "ollama":
@@ -461,7 +736,7 @@ async def chat_message(body: ChatMessage, _: None = Depends(require_api_key), ll
             if query_embedding:
                 # Query PostgreSQL
                 try:
-                    result = await mem_system.query_context(body.message, query_embedding, k=body.top_k)
+                    result = await mem_system.query_similar(body.message, query_embedding, k=body.top_k)
                     if result.get("success"):
                         contexts = result.get("snippets", [])
                 except Exception as e:
@@ -532,7 +807,7 @@ async def chat_stream(body: ChatMessage, _: None = Depends(require_api_key), llm
     # Try to retrieve context using PostgreSQL memory system first
     contexts = []
     try:
-        mem_system = await _get_memory_system()
+        mem_system = await _get_simple_memory_system()
         if mem_system:
             # Use PostgreSQL memory system
             if LLM_PROVIDER == "ollama":
@@ -563,7 +838,7 @@ async def chat_stream(body: ChatMessage, _: None = Depends(require_api_key), llm
             if query_embedding:
                 # Query PostgreSQL
                 try:
-                    result = await mem_system.query_context(body.message, query_embedding, k=body.top_k)
+                    result = await mem_system.query_similar(body.message, query_embedding, k=body.top_k)
                     if result.get("success"):
                         contexts = result.get("snippets", [])
                 except Exception as e:
@@ -759,7 +1034,7 @@ async def memory_store(body: StoreBody, _: None = Depends(require_api_key), llm_
     """Store user input and response in memory with embeddings"""
     try:
         # Try PostgreSQL memory system first
-        mem_system = await _get_memory_system()
+        mem_system = await _get_simple_memory_system()
         if mem_system:
             try:
                 # Use PostgreSQL memory system
@@ -873,141 +1148,77 @@ async def memory_store(body: StoreBody, _: None = Depends(require_api_key), llm_
 
 @app.get("/memory/query")
 async def memory_query(query: str, k: int = 5, _: None = Depends(require_api_key), llm_key: Optional[str] = Depends(get_llm_key)) -> Dict[str, Any]:
-    """Query memory for similar content using vector similarity"""
+    """Query memory for similar content using simple PostgreSQL search"""
     try:
-        # Try PostgreSQL memory system first
-        mem_system = await _get_memory_system()
+        # Try simple PostgreSQL memory system first
+        mem_system = await _get_simple_memory_system()
         if mem_system:
             try:
-                # Use PostgreSQL memory system
-                # Generate embedding for query
-                if LLM_PROVIDER == "ollama":
-                    try:
-                        embed_data = _ollama_post(
-                            "/api/embeddings",
-                            {"model": OLLAMA_EMBED_MODEL, "prompt": query},
-                            timeout=300
-                        )
-                        query_embedding = embed_data.get("embedding") or embed_data.get("embeddings", [])
-                    except Exception as e:
-                        return {"success": False, "error": f"Embedding generation failed: {e}"}
-                else:
-                    # OpenAI embedding
-                    client = _get_openai_client(llm_key)
-                    if client:
-                        try:
-                            embed_res = client.embeddings.create(
-                                model=EMBED_MODEL,
-                                input=query
-                            )
-                            query_embedding = embed_res.data[0].embedding
-                        except Exception as e:
-                            return {"success": False, "error": f"OpenAI embedding failed: {e}"}
-                    else:
-                        return {"success": False, "error": "No embedding provider available"}
-                
-                # Query PostgreSQL
-                try:
-                    result = await mem_system.query_context(query, query_embedding, k=k)
-                    if result.get("success"):
-                        return {
-                            "success": True,
-                            "type": "postgresql_pgvector",
-                            "query": query,
-                            "results": result.get("snippets", []),
-                            "total_found": len(result.get("snippets", []))
-                        }
-                    else:
-                        return {"success": False, "error": f"PostgreSQL query failed: {result.get('error')}"}
-                except Exception as e:
-                    return {"success": False, "error": f"PostgreSQL operation failed: {e}"}
-                
+                results = await mem_system.query_similar(query, k)
+                return {
+                    "success": True,
+                    "type": "postgresql_pgvector",
+                    "query": query,
+                    "total_found": len(results),
+                    "snippets": results
+                }
             except Exception as e:
-                return {"success": False, "error": f"PostgreSQL memory system error: {e}"}
+                print(f"Simple PostgreSQL query failed: {e}")
         
         # Fallback to JSON file storage
         mem = _load_memory()
         items = mem.get("items", [])
         if not items:
-            return {"success": True, "type": "json_file", "query": query, "results": [], "total_found": 0}
+            return {"success": True, "type": "json_file", "query": query, "snippets": [], "total_found": 0}
         
-        # Generate embedding for query
-        if LLM_PROVIDER == "ollama":
+        # Simple text search in JSON items
+        results = []
+        for item in items:
+            if query.lower() in item.get("user_input", "").lower() or query.lower() in item.get("response", "").lower():
+                results.append(item)
+                if len(results) >= k:
+                    break
+        
+        return {
+            "success": True,
+            "type": "json_file",
+            "query": query,
+            "total_found": len(results),
+            "snippets": results
+        }
+        
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/memory/documents")
+async def get_available_documents(limit: int = Query(10, description="Number of documents to return", ge=1, le=50), _: None = Depends(require_api_key)) -> Dict[str, Any]:
+    """Get available documents for preview"""
+    try:
+        # Try simple PostgreSQL memory system first
+        mem_system = await _get_simple_memory_system()
+        if mem_system:
             try:
-                embed_data = _ollama_post(
-                    "/api/embeddings",
-                    {"model": OLLAMA_EMBED_MODEL, "prompt": query},
-                    timeout=300
-                )
-                query_embedding = embed_data.get("embedding") or embed_data.get("embeddings", [])
+                documents = await mem_system.get_sample_documents(limit)
+                doc_count = await mem_system.get_document_count()
+                return {
+                    "success": True,
+                    "type": "postgresql_pgvector",
+                    "total_documents": doc_count,
+                    "documents": documents
+                }
             except Exception as e:
-                return {"success": False, "error": f"Embedding generation failed: {e}"}
-        else:
-            # OpenAI embedding
-            client = _get_openai_client(llm_key)
-            if client:
-                try:
-                    embed_res = client.embeddings.create(
-                        model=EMBED_MODEL,
-                        input=query
-                    )
-                    query_embedding = embed_res.data[0].embedding
-                except Exception as e:
-                    return {"success": False, "error": f"OpenAI embedding failed: {e}"}
-            else:
-                return {"success": False, "error": "No embedding provider available"}
+                print(f"Failed to get documents from PostgreSQL: {e}")
         
-        # Simple similarity search in JSON file
-        if query_embedding:
-            scored_items = []
-            for item in items:
-                item_embedding = item.get("embedding", [])
-                if item_embedding and len(item_embedding) == len(query_embedding):
-                    similarity = _cosine_sim(np.array(query_embedding), np.array(item_embedding))
-                    scored_items.append((similarity, item))
-            
-            # Sort by similarity and return top k
-            scored_items.sort(key=lambda x: x[0], reverse=True)
-            top_items = scored_items[:k]
-            
-            results = []
-            for similarity, item in top_items:
-                results.append({
-                    "id": item.get("id", "unknown"),
-                    "similarity": float(similarity),
-                    "user_input": item.get("user_input", ""),
-                    "response": item.get("response", ""),
-                    "timestamp": item.get("timestamp", 0),
-                    "metadata": item.get("metadata", {})
-                })
-            
-            return {
-                "success": True,
-                "type": "json_file",
-                "query": query,
-                "results": results,
-                "total_found": len(results)
-            }
-        else:
-            # No embedding available, return all items
-            results = []
-            for item in items[:k]:
-                results.append({
-                    "id": item.get("id", "unknown"),
-                    "similarity": None,
-                    "user_input": item.get("user_input", ""),
-                    "response": item.get("response", ""),
-                    "timestamp": item.get("timestamp", 0),
-                    "metadata": item.get("metadata", {})
-                })
-            
-            return {
-                "success": True,
-                "type": "json_file",
-                "query": query,
-                "results": results,
-                "total_found": len(results)
-            }
+        # Fallback to JSON file
+        mem = _load_memory()
+        items = mem.get("items", [])
+        return {
+            "success": True,
+            "type": "json_file",
+            "total_documents": len(items),
+            "documents": items[:limit]
+        }
         
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -1180,7 +1391,7 @@ async def ingest_files(
             
             # Try to store in PostgreSQL memory system first
             try:
-                mem_system = await _get_memory_system()
+                mem_system = await _get_simple_memory_system()
                 if mem_system:
                     # Use PostgreSQL memory system
                     from src.layers.memory_system import Interaction

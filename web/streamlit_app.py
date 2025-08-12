@@ -5,11 +5,14 @@ import time
 import subprocess
 from pathlib import Path
 
+# Fix Python path for imports
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
 import streamlit as st
 from src.utils.smart_ping import probe_target
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # Prefer Streamlit secrets in cloud, then env var, then a sane hosted default
 API_BASE = (
     (st.secrets.get("API_BASE") if hasattr(st, "secrets") else None)

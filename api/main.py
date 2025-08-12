@@ -322,6 +322,32 @@ class SimplePostgreSQLMemory:
         except Exception as e:
             print(f"Failed to get sample documents: {e}")
             return []
+
+    async def get_document_by_id(self, doc_id: int) -> Optional[Dict[str, Any]]:
+        """Fetch full document by id."""
+        try:
+            if not self._pool:
+                await self.initialize()
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, source, content, created_at
+                    FROM vector_store
+                    WHERE id = $1
+                    """,
+                    doc_id,
+                )
+                if not row:
+                    return None
+                return {
+                    "id": str(row["id"]),
+                    "source": row["source"],
+                    "content": row["content"],
+                    "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                }
+        except Exception as e:
+            print(f"Failed to get document by id: {e}")
+            return None
     
     async def store_interaction(self, interaction: Interaction, embedding: List[float]) -> Dict[str, Any]:
         """Store interaction with embedding in PostgreSQL"""
@@ -331,16 +357,17 @@ class SimplePostgreSQLMemory:
             
             async with self._pool.acquire() as conn:
                 # Store the interaction in vector_store table
-                await conn.execute(
+                new_id = await conn.fetchval(
                     """
                     INSERT INTO vector_store (source, content, created_at)
                     VALUES ($1, $2, $3)
+                    RETURNING id
                     """,
                     getattr(interaction, 'source', 'unknown'),
                     f"{interaction.user_input}\n{interaction.response}",
                     datetime.now()
                 )
-                return {"success": True, "record_id": "stored"}
+                return {"success": True, "record_id": int(new_id)}
         except Exception as e:
             print(f"Failed to store interaction in PostgreSQL: {e}")
             return {"success": False, "error": str(e)}
@@ -1078,7 +1105,8 @@ async def memory_store(body: StoreBody, _: None = Depends(require_api_key), llm_
                 
                 # Store in PostgreSQL
                 try:
-                    result = await mem_system.store_interaction(interaction, embedding)
+                        # Preserve original filename in content if provided via metadata
+                        result = await mem_system.store_interaction(interaction, embedding)
                     if result.get("success"):
                         return {
                             "success": True,
@@ -1220,6 +1248,28 @@ async def get_available_documents(limit: int = Query(10, description="Number of 
             "documents": items[:limit]
         }
         
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/memory/document/{doc_id}")
+async def get_document(doc_id: int, _: None = Depends(require_api_key)) -> Dict[str, Any]:
+    """Fetch a single document by id with full content."""
+    try:
+        mem_system = await _get_simple_memory_system()
+        if mem_system:
+            doc = await mem_system.get_document_by_id(doc_id)
+            if doc:
+                return {"success": True, "type": "postgresql_pgvector", "document": doc}
+            return {"success": False, "error": "not_found"}
+        # Fallback JSON: derive from list index
+        mem = _load_memory()
+        items = mem.get("items", [])
+        idx = max(0, min(len(items) - 1, doc_id - 1))
+        if 0 <= idx < len(items):
+            it = items[idx]
+            return {"success": True, "type": "json_file", "document": {"id": str(doc_id), "source": "json_file", "content": it.get("response", ""), "created_at": None}}
+        return {"success": False, "error": "not_found"}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1398,11 +1448,12 @@ async def ingest_files(
                     from datetime import datetime
                     
                     # Create interaction object
+                    original_name = (uf.filename or "file")
                     interaction = Interaction(
-                        user_input=f"upload:{uf.filename} {source or ''}",
-                        response=text,
+                        user_input=f"upload:{original_name} {source or ''}",
+                        response=f"[filename: {original_name}]\n{text}",
                         tool_calls=[],
-                        metadata={"source": "file_upload", "filename": uf.filename},
+                        metadata={"source": "file_upload", "filename": original_name},
                         timestamp=datetime.now()
                     )
                     

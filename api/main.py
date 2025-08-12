@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import hashlib
 import platform
 import json as _json
+import asyncio
 
 import numpy as np
 import requests
@@ -21,6 +22,13 @@ try:
 except Exception:  # pragma: no cover
     OpenAI = None  # type: ignore
 
+# Import PostgreSQL memory system
+try:
+    from src.layers.memory_system import MemorySystem
+    POSTGRES_MEMORY_AVAILABLE = True
+except ImportError:
+    POSTGRES_MEMORY_AVAILABLE = False
+    MemorySystem = None
 
 API_KEY_ENV = os.getenv("API_KEY", "demo_key_123")
 
@@ -186,6 +194,7 @@ def tools_call(body: ToolCall, _: None = Depends(require_api_key)) -> Dict[str, 
 # Simple RAG + LLM wiring
 # ---------------------------
 
+# Memory system configuration
 MEMORY_PATH = Path(os.getenv("MEMORY_PATH", "./memory_store.json")).resolve()
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
@@ -196,6 +205,48 @@ OLLAMA_BASE = os.getenv("OLLAMA_BASE", "http://ollama:11434").rstrip("/")
 OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "llama3.2:3b")
 OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "mxbai-embed-large")
 EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))
+
+# PostgreSQL memory system
+_memory_system: Optional[MemorySystem] = None
+_memory_system_lock = asyncio.Lock()
+
+async def _get_memory_system() -> Optional[MemorySystem]:
+    """Get or create PostgreSQL memory system instance with proper async handling"""
+    global _memory_system
+    if not POSTGRES_MEMORY_AVAILABLE:
+        return None
+    
+    if _memory_system is None:
+        async with _memory_system_lock:
+            if _memory_system is None:  # Double-check pattern
+                try:
+                    _memory_system = MemorySystem(
+                        connection_string=os.getenv("DATABASE_URL"),
+                        embedding_dimension=EMBED_DIM
+                    )
+                except Exception as e:
+                    print(f"Warning: Failed to initialize PostgreSQL memory system: {e}")
+                    return None
+    
+    return _memory_system
+
+def _get_memory_system_sync() -> Optional[MemorySystem]:
+    """Synchronous wrapper for memory system - for non-async contexts"""
+    global _memory_system
+    if not POSTGRES_MEMORY_AVAILABLE:
+        return None
+    
+    if _memory_system is None:
+        try:
+            _memory_system = MemorySystem(
+                connection_string=os.getenv("DATABASE_URL"),
+                embedding_dimension=EMBED_DIM
+            )
+        except Exception as e:
+            print(f"Warning: Failed to initialize PostgreSQL memory system: {e}")
+            return None
+    
+    return _memory_system
 
 # Process identity
 STARTED_AT = int(time.time())
@@ -214,19 +265,51 @@ def get_llm_key(x_llm_key: Optional[str] = Header(None)) -> Optional[str]:
 
 
 def _ensure_memory_file() -> None:
+    """Fallback to JSON file if PostgreSQL not available"""
     if not MEMORY_PATH.exists():
         MEMORY_PATH.write_text(json.dumps({"items": []}), encoding="utf-8")
 
 
 def _load_memory() -> Dict[str, Any]:
+    """Load memory - prefer PostgreSQL, fallback to JSON file"""
+    # Try PostgreSQL first
+    mem_system = _get_memory_system_sync()
+    if mem_system:
+        try:
+            # Return PostgreSQL memory info
+            return {
+                "type": "postgresql_pgvector",
+                "database_url": os.getenv("DATABASE_URL", "not_set"),
+                "embedding_dimension": EMBED_DIM,
+                "available": True
+            }
+        except Exception:
+            pass
+    
+    # Fallback to JSON file
     _ensure_memory_file()
     try:
-        return json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
+        return {
+            "type": "json_file",
+            "path": str(MEMORY_PATH),
+            "items": json.loads(MEMORY_PATH.read_text(encoding="utf-8")).get("items", [])
+        }
     except Exception:
-        return {"items": []}
+        return {"type": "json_file", "path": str(MEMORY_PATH), "items": []}
 
 
 def _save_memory(data: Dict[str, Any]) -> None:
+    """Save memory - prefer PostgreSQL, fallback to JSON file"""
+    # Try PostgreSQL first
+    mem_system = _get_memory_system_sync()
+    if mem_system:
+        try:
+            # PostgreSQL memory is handled by the MemorySystem class
+            return
+        except Exception:
+            pass
+    
+    # Fallback to JSON file
     MEMORY_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
@@ -343,11 +426,63 @@ class ChatMessage(BaseModel):
 
 
 @app.post("/chat/message")
-def chat_message(body: ChatMessage, _: None = Depends(require_api_key), llm_key: Optional[str] = Depends(get_llm_key)) -> Dict[str, Any]:
-    # Retrieve (provider-agnostic embeddings)
-    client = _get_openai_client(llm_key) if LLM_PROVIDER != "ollama" else None
-    contexts = _retrieve(client, body.message, k=max(1, min(10, body.top_k)))
-    docs = "\n\n".join([f"[Doc {i+1}]\n" + (c.get("text") or "") for i, c in enumerate(contexts)])
+async def chat_message(body: ChatMessage, _: None = Depends(require_api_key), llm_key: Optional[str] = Depends(get_llm_key)) -> Dict[str, Any]:
+    # Try to retrieve context using PostgreSQL memory system first
+    contexts = []
+    try:
+        mem_system = await _get_memory_system()
+        if mem_system:
+            # Use PostgreSQL memory system
+            if LLM_PROVIDER == "ollama":
+                try:
+                    embed_data = _ollama_post(
+                        "/api/embeddings",
+                        {"model": OLLAMA_EMBED_MODEL, "prompt": body.message},
+                        timeout=300
+                    )
+                    query_embedding = embed_data.get("embedding") or embed_data.get("embeddings", [])
+                except Exception as e:
+                    return {"answer": f"Embedding generation failed: {e}"}
+            else:
+                # OpenAI embedding
+                client = _get_openai_client(llm_key)
+                if client:
+                    try:
+                        embed_res = client.embeddings.create(
+                            model=EMBED_MODEL,
+                            input=body.message
+                        )
+                        query_embedding = embed_res.data[0].embedding
+                    except Exception as e:
+                        return {"answer": f"OpenAI embedding failed: {e}"}
+                else:
+                    query_embedding = []
+            
+            if query_embedding:
+                # Query PostgreSQL
+                try:
+                    result = await mem_system.query_context(body.message, query_embedding, k=body.top_k)
+                    if result.get("success"):
+                        contexts = result.get("snippets", [])
+                except Exception as e:
+                    # Fall back to old method
+                    pass
+    except Exception:
+        # Fall back to old method
+        pass
+    
+    # Fallback to old retrieval method if PostgreSQL failed
+    if not contexts:
+        client = _get_openai_client(llm_key) if LLM_PROVIDER != "ollama" else None
+        contexts = _retrieve(client, body.message, k=max(1, min(10, body.top_k)))
+    
+    # Format context documents
+    if contexts and hasattr(contexts[0], 'get'):
+        # PostgreSQL results
+        docs = "\n\n".join([f"[Doc {i+1}]\n" + (c.get("preview", "") or "") for i, c in enumerate(contexts)])
+    else:
+        # Old format results
+        docs = "\n\n".join([f"[Doc {i+1}]\n" + (c.get("text", "") or "") for i, c in enumerate(contexts)])
 
     system = (
         "You are the agent brain with access to retrieved context from prior sessions. "
@@ -389,14 +524,68 @@ def chat_message(body: ChatMessage, _: None = Depends(require_api_key), llm_key:
 
 
 @app.post("/chat/stream")
-def chat_stream(body: ChatMessage, _: None = Depends(require_api_key), llm_key: Optional[str] = Depends(get_llm_key)):
+async def chat_stream(body: ChatMessage, _: None = Depends(require_api_key), llm_key: Optional[str] = Depends(get_llm_key)):
     """Stream chat answer with periodic keepalives so tunnels/proxies don't time out.
     Sends small whitespace heartbeats every ~8 seconds and yields partial tokens
     as available. Client should treat it as text/event-stream or chunked text.
     """
-    client = _get_openai_client(llm_key) if LLM_PROVIDER != "ollama" else None
-    contexts = _retrieve(client, body.message, k=max(1, min(10, body.top_k)))
-    docs = "\n\n".join([f"[Doc {i+1}]\n" + (c.get("text") or "") for i, c in enumerate(contexts)])
+    # Try to retrieve context using PostgreSQL memory system first
+    contexts = []
+    try:
+        mem_system = await _get_memory_system()
+        if mem_system:
+            # Use PostgreSQL memory system
+            if LLM_PROVIDER == "ollama":
+                try:
+                    embed_data = _ollama_post(
+                        "/api/embeddings",
+                        {"model": OLLAMA_EMBED_MODEL, "prompt": body.message},
+                        timeout=300
+                    )
+                    query_embedding = embed_data.get("embedding") or embed_data.get("embeddings", [])
+                except Exception as e:
+                    return {"answer": f"Embedding generation failed: {e}"}
+            else:
+                # OpenAI embedding
+                client = _get_openai_client(llm_key)
+                if client:
+                    try:
+                        embed_res = client.embeddings.create(
+                            model=EMBED_MODEL,
+                            input=body.message
+                        )
+                        query_embedding = embed_res.data[0].embedding
+                    except Exception as e:
+                        return {"answer": f"OpenAI embedding failed: {e}"}
+                else:
+                    query_embedding = []
+            
+            if query_embedding:
+                # Query PostgreSQL
+                try:
+                    result = await mem_system.query_context(body.message, query_embedding, k=body.top_k)
+                    if result.get("success"):
+                        contexts = result.get("snippets", [])
+                except Exception as e:
+                    # Fall back to old method
+                    pass
+    except Exception:
+        # Fall back to old method
+        pass
+    
+    # Fallback to old retrieval method if PostgreSQL failed
+    if not contexts:
+        client = _get_openai_client(llm_key) if LLM_PROVIDER != "ollama" else None
+        contexts = _retrieve(client, body.message, k=max(1, min(10, body.top_k)))
+    
+    # Format context documents
+    if contexts and hasattr(contexts[0], 'get'):
+        # PostgreSQL results
+        docs = "\n\n".join([f"[Doc {i+1}]\n" + (c.get("preview", "") or "") for i, c in enumerate(contexts)])
+    else:
+        # Old format results
+        docs = "\n\n".join([f"[Doc {i+1}]\n" + (c.get("text", "") or "") for i, c in enumerate(contexts)])
+    
     system = (
         "You are the agent brain with access to retrieved context from prior sessions. "
         "Use the provided documents if relevant. If not enough information is present, say so briefly."
@@ -566,32 +755,262 @@ class StoreBody(BaseModel):
 
 
 @app.post("/memory/store")
-def memory_store(body: StoreBody, __: None = Depends(require_api_key), llm_key: Optional[str] = Depends(get_llm_key)) -> Dict[str, Any]:
-    raw_resp = body.response or ""
-    if (not raw_resp) and body.response_b64:
-        try:
-            import base64
-            raw_resp = base64.b64decode(body.response_b64).decode("utf-8", errors="ignore")
-        except Exception:
-            raw_resp = ""
-    text = (body.user_input or "").strip() + "\n" + raw_resp.strip()
-    client = _get_openai_client(llm_key) if LLM_PROVIDER != "ollama" else None
-    vecs = _embed_texts(client, [text])
-    embedded = bool(vecs)
-    vec = vecs[0] if embedded else []
-    mem = _load_memory()
-    mem.setdefault("items", []).append(
-        {"id": f"m_{int(time.time()*1000)}", "text": text, "embedding": vec, "ts": int(time.time())}
-    )
-    _save_memory(mem)
-    return {"stored": True, "embedded": embedded}
+async def memory_store(body: StoreBody, _: None = Depends(require_api_key), llm_key: Optional[str] = Depends(get_llm_key)) -> Dict[str, Any]:
+    """Store user input and response in memory with embeddings"""
+    try:
+        # Try PostgreSQL memory system first
+        mem_system = await _get_memory_system()
+        if mem_system:
+            try:
+                # Use PostgreSQL memory system
+                from src.layers.memory_system import Interaction
+                from datetime import datetime
+                
+                # Create interaction object
+                interaction = Interaction(
+                    user_input=body.user_input,
+                    response=body.response,
+                    tool_calls=[],
+                    metadata={},
+                    timestamp=datetime.now()
+                )
+                
+                # Generate embedding
+                if LLM_PROVIDER == "ollama":
+                    try:
+                        embed_data = _ollama_post(
+                            "/api/embeddings",
+                            {"model": OLLAMA_EMBED_MODEL, "prompt": body.user_input + "\n" + body.response},
+                            timeout=300
+                        )
+                        embedding = embed_data.get("embedding") or embed_data.get("embeddings", [])
+                    except Exception as e:
+                        return {"success": False, "error": f"Embedding generation failed: {e}"}
+                else:
+                    # OpenAI embedding
+                    client = _get_openai_client(llm_key)
+                    if client:
+                        try:
+                            embed_res = client.embeddings.create(
+                                model=EMBED_MODEL,
+                                input=body.user_input + "\n" + body.response
+                            )
+                            embedding = embed_res.data[0].embedding
+                        except Exception as e:
+                            return {"success": False, "error": f"OpenAI embedding failed: {e}"}
+                    else:
+                        return {"success": False, "error": "No embedding provider available"}
+                
+                # Store in PostgreSQL
+                try:
+                    result = await mem_system.store_interaction(interaction, embedding)
+                    if result.get("success"):
+                        return {
+                            "success": True,
+                            "message": "Stored in PostgreSQL vector database",
+                            "record_id": result.get("record_id"),
+                            "type": "postgresql_pgvector"
+                        }
+                    else:
+                        return {"success": False, "error": f"PostgreSQL storage failed: {result.get('error')}"}
+                except Exception as e:
+                    return {"success": False, "error": f"PostgreSQL operation failed: {e}"}
+                
+            except Exception as e:
+                return {"success": False, "error": f"PostgreSQL memory system error: {e}"}
+        
+        # Fallback to JSON file storage
+        mem = _load_memory()
+        items = mem.get("items", [])
+        
+        # Generate embedding for similarity search
+        if LLM_PROVIDER == "ollama":
+            try:
+                embed_data = _ollama_post(
+                    "/api/embeddings",
+                    {"model": OLLAMA_EMBED_MODEL, "prompt": body.user_input + "\n" + body.response},
+                    timeout=300
+                )
+                embedding = embed_data.get("embedding") or embed_data.get("embeddings", [])
+            except Exception as e:
+                return {"success": False, "error": f"Embedding generation failed: {e}"}
+        else:
+            # OpenAI embedding
+            client = _get_openai_client(llm_key)
+            if client:
+                try:
+                    embed_res = client.embeddings.create(
+                        model=EMBED_MODEL,
+                        input=body.user_input + "\n" + body.response
+                    )
+                    embedding = embed_res.data[0].embedding
+                except Exception as e:
+                    return {"success": False, "error": f"OpenAI embedding failed: {e}"}
+            else:
+                embedding = []
+        
+        # Store in JSON file
+        item = {
+            "user_input": body.user_input,
+            "response": body.response,
+            "embedding": embedding,
+            "timestamp": time.time(),
+            "metadata": {}
+        }
+        items.append(item)
+        _save_memory({"items": items})
+        
+        return {
+            "success": True,
+            "message": "Stored in JSON file (PostgreSQL not available)",
+            "type": "json_file",
+            "total_items": len(items)
+        }
+        
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 @app.get("/memory/query")
-def memory_query(q: str, k: int = 5, _: None = Depends(require_api_key), llm_key: Optional[str] = Depends(get_llm_key)) -> Dict[str, Any]:
-    client = _get_openai_client(llm_key) if LLM_PROVIDER != "ollama" else None
-    items = _retrieve(client, q, k=max(1, min(20, k)))
-    return {"snippets": [{"preview": it.get("text", "")[:800]} for it in items]}
+async def memory_query(query: str, k: int = 5, _: None = Depends(require_api_key), llm_key: Optional[str] = Depends(get_llm_key)) -> Dict[str, Any]:
+    """Query memory for similar content using vector similarity"""
+    try:
+        # Try PostgreSQL memory system first
+        mem_system = await _get_memory_system()
+        if mem_system:
+            try:
+                # Use PostgreSQL memory system
+                # Generate embedding for query
+                if LLM_PROVIDER == "ollama":
+                    try:
+                        embed_data = _ollama_post(
+                            "/api/embeddings",
+                            {"model": OLLAMA_EMBED_MODEL, "prompt": query},
+                            timeout=300
+                        )
+                        query_embedding = embed_data.get("embedding") or embed_data.get("embeddings", [])
+                    except Exception as e:
+                        return {"success": False, "error": f"Embedding generation failed: {e}"}
+                else:
+                    # OpenAI embedding
+                    client = _get_openai_client(llm_key)
+                    if client:
+                        try:
+                            embed_res = client.embeddings.create(
+                                model=EMBED_MODEL,
+                                input=query
+                            )
+                            query_embedding = embed_res.data[0].embedding
+                        except Exception as e:
+                            return {"success": False, "error": f"OpenAI embedding failed: {e}"}
+                    else:
+                        return {"success": False, "error": "No embedding provider available"}
+                
+                # Query PostgreSQL
+                try:
+                    result = await mem_system.query_context(query, query_embedding, k=k)
+                    if result.get("success"):
+                        return {
+                            "success": True,
+                            "type": "postgresql_pgvector",
+                            "query": query,
+                            "results": result.get("snippets", []),
+                            "total_found": len(result.get("snippets", []))
+                        }
+                    else:
+                        return {"success": False, "error": f"PostgreSQL query failed: {result.get('error')}"}
+                except Exception as e:
+                    return {"success": False, "error": f"PostgreSQL operation failed: {e}"}
+                
+            except Exception as e:
+                return {"success": False, "error": f"PostgreSQL memory system error: {e}"}
+        
+        # Fallback to JSON file storage
+        mem = _load_memory()
+        items = mem.get("items", [])
+        if not items:
+            return {"success": True, "type": "json_file", "query": query, "results": [], "total_found": 0}
+        
+        # Generate embedding for query
+        if LLM_PROVIDER == "ollama":
+            try:
+                embed_data = _ollama_post(
+                    "/api/embeddings",
+                    {"model": OLLAMA_EMBED_MODEL, "prompt": query},
+                    timeout=300
+                )
+                query_embedding = embed_data.get("embedding") or embed_data.get("embeddings", [])
+            except Exception as e:
+                return {"success": False, "error": f"Embedding generation failed: {e}"}
+        else:
+            # OpenAI embedding
+            client = _get_openai_client(llm_key)
+            if client:
+                try:
+                    embed_res = client.embeddings.create(
+                        model=EMBED_MODEL,
+                        input=query
+                    )
+                    query_embedding = embed_res.data[0].embedding
+                except Exception as e:
+                    return {"success": False, "error": f"OpenAI embedding failed: {e}"}
+            else:
+                return {"success": False, "error": "No embedding provider available"}
+        
+        # Simple similarity search in JSON file
+        if query_embedding:
+            scored_items = []
+            for item in items:
+                item_embedding = item.get("embedding", [])
+                if item_embedding and len(item_embedding) == len(query_embedding):
+                    similarity = _cosine_sim(np.array(query_embedding), np.array(item_embedding))
+                    scored_items.append((similarity, item))
+            
+            # Sort by similarity and return top k
+            scored_items.sort(key=lambda x: x[0], reverse=True)
+            top_items = scored_items[:k]
+            
+            results = []
+            for similarity, item in top_items:
+                results.append({
+                    "id": item.get("id", "unknown"),
+                    "similarity": float(similarity),
+                    "user_input": item.get("user_input", ""),
+                    "response": item.get("response", ""),
+                    "timestamp": item.get("timestamp", 0),
+                    "metadata": item.get("metadata", {})
+                })
+            
+            return {
+                "success": True,
+                "type": "json_file",
+                "query": query,
+                "results": results,
+                "total_found": len(results)
+            }
+        else:
+            # No embedding available, return all items
+            results = []
+            for item in items[:k]:
+                results.append({
+                    "id": item.get("id", "unknown"),
+                    "similarity": None,
+                    "user_input": item.get("user_input", ""),
+                    "response": item.get("response", ""),
+                    "timestamp": item.get("timestamp", 0),
+                    "metadata": item.get("metadata", {})
+                })
+            
+            return {
+                "success": True,
+                "type": "json_file",
+                "query": query,
+                "results": results,
+                "total_found": len(results)
+            }
+        
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 # Content preview (mock)
@@ -660,12 +1079,29 @@ def _components_snapshot() -> Dict[str, Any]:
         "chat_stream": True,
         "ingest_files": True,
     }
-    # Memory
+    # Memory system status
     try:
-        mem = _load_memory()
-        components["memory"] = {"path": str(MEMORY_PATH), "items": len(mem.get("items", []))}
+        mem_info = _load_memory()
+        if mem_info.get("type") == "postgresql_pgvector":
+            # PostgreSQL memory system
+            components["memory"] = {
+                "type": "postgresql_pgvector",
+                "database_url": mem_info.get("database_url", "not_set"),
+                "embedding_dimension": mem_info.get("embedding_dimension", EMBED_DIM),
+                "available": mem_info.get("available", False),
+                "status": "active" if mem_info.get("available") else "error"
+            }
+        else:
+            # JSON file fallback
+            components["memory"] = {
+                "type": "json_file",
+                "path": str(MEMORY_PATH),
+                "items": mem_info.get("items", []),
+                "status": "fallback"
+            }
     except Exception as e:
-        components["memory"] = {"error": str(e)}
+        components["memory"] = {"error": str(e), "status": "error"}
+    
     # LLM provider quick signal
     if LLM_PROVIDER == "ollama":
         try:
@@ -732,6 +1168,7 @@ async def ingest_files(
     stored = 0
     errs = 0
     details: List[Dict[str, Any]] = []
+    
     for uf in files:
         try:
             data = await uf.read()
@@ -740,13 +1177,86 @@ async def ingest_files(
                 details.append({"file": uf.filename, "ok": False, "reason": "empty"})
                 errs += 1
                 continue
+            
+            # Try to store in PostgreSQL memory system first
+            try:
+                mem_system = await _get_memory_system()
+                if mem_system:
+                    # Use PostgreSQL memory system
+                    from src.layers.memory_system import Interaction
+                    from datetime import datetime
+                    
+                    # Create interaction object
+                    interaction = Interaction(
+                        user_input=f"upload:{uf.filename} {source or ''}",
+                        response=text,
+                        tool_calls=[],
+                        metadata={"source": "file_upload", "filename": uf.filename},
+                        timestamp=datetime.now()
+                    )
+                    
+                    # Generate embedding
+                    if LLM_PROVIDER == "ollama":
+                        try:
+                            embed_data = _ollama_post(
+                                "/api/embeddings",
+                                {"model": OLLAMA_EMBED_MODEL, "prompt": text},
+                                timeout=300
+                            )
+                            embedding = embed_data.get("embedding") or embed_data.get("embeddings", [])
+                        except Exception as e:
+                            details.append({"file": uf.filename, "ok": False, "error": f"Embedding failed: {e}"})
+                            errs += 1
+                            continue
+                    else:
+                        # OpenAI embedding
+                        client = _get_openai_client(llm_key)
+                        if client:
+                            try:
+                                embed_res = client.embeddings.create(
+                                    model=EMBED_MODEL,
+                                    input=text
+                                )
+                                embedding = embed_res.data[0].embedding
+                            except Exception as e:
+                                details.append({"file": uf.filename, "ok": False, "error": f"OpenAI embedding failed: {e}"})
+                                errs += 1
+                                continue
+                        else:
+                            details.append({"file": uf.filename, "ok": False, "error": "No embedding provider available"})
+                            errs += 1
+                            continue
+                    
+                    # Store in PostgreSQL
+                    try:
+                        result = await mem_system.store_interaction(interaction, embedding)
+                        if result.get("success"):
+                            details.append({"file": uf.filename, "ok": True, "chars": len(text), "type": "postgresql_pgvector"})
+                            stored += 1
+                            continue
+                        else:
+                            details.append({"file": uf.filename, "ok": False, "error": f"PostgreSQL storage failed: {result.get('error')}"})
+                            errs += 1
+                            continue
+                    except Exception as e:
+                        details.append({"file": uf.filename, "ok": False, "error": f"PostgreSQL operation failed: {e}"})
+                        errs += 1
+                        continue
+                        
+            except Exception as e:
+                # Fall back to old method
+                pass
+            
+            # Fallback to old JSON file storage
             body = StoreBody(user_input=f"upload:{uf.filename} {source or ''}", response=text)
-            memory_store(body, None, llm_key)  # reuse in-process
-            details.append({"file": uf.filename, "ok": True, "chars": len(text)})
+            await memory_store(body, None, llm_key)  # reuse in-process
+            details.append({"file": uf.filename, "ok": True, "chars": len(text), "type": "json_file"})
             stored += 1
+            
         except Exception as e:
             errs += 1
             details.append({"file": uf.filename, "ok": False, "error": str(e)})
+    
     return IngestResponse(stored=stored, errors=errs, details=details)
 
 

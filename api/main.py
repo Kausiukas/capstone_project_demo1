@@ -163,7 +163,8 @@ def performance_health(_: None = Depends(require_api_key)) -> Dict[str, Any]:
 # Tools registry
 @app.get("/tools/list")
 def tools_list(_: None = Depends(require_api_key)) -> Dict[str, Any]:
-    return {"tools": ["ping", "list_files", "read_file", "get_system_status", "analyze_code"]}
+    # Reverted to canonical tool names (including get_system_status)
+    return {"tools": ["ping", "list_files", "read_file", "analyze_code", "get_system_status"]}
 
 
 @app.get("/tools/registry/health")
@@ -188,6 +189,71 @@ def tools_call(body: ToolCall, _: None = Depends(require_api_key)) -> Dict[str, 
             "memory": components.get("memory", {}),
             "endpoints": components.get("endpoints", {}),
         }
+    if body.name == "list_files":
+        try:
+            limit = int(body.arguments.get("limit", 20))
+        except Exception:
+            limit = 20
+        # Reuse internal helper
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            data = loop.run_until_complete(_list_documents(limit=limit))
+        finally:
+            loop.close()
+        return {"tool": "list_files", "data": data}
+    if body.name == "read_file":
+        # Expect argument: id
+        doc_id = body.arguments.get("id")
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            data: Dict[str, Any]
+            data = {"success": False, "error": "invalid_id"}
+            if doc_id is not None:
+                try:
+                    ms = loop.run_until_complete(_get_simple_memory_system())
+                    if ms:
+                        doc = loop.run_until_complete(ms.get_document_by_id(int(doc_id)))
+                        if doc:
+                            data = {"success": True, "document": doc, "type": "postgresql_pgvector"}
+                        else:
+                            data = {"success": False, "error": "not_found"}
+                    else:
+                        # Fallback to JSON by index
+                        mem = _load_memory()
+                        items = mem.get("items", [])
+                        idx = max(0, min(len(items) - 1, int(doc_id) - 1))
+                        if 0 <= idx < len(items):
+                            it = items[idx]
+                            data = {"success": True, "document": {"id": str(doc_id), "source": "json_file", "content": it.get("response", "")}, "type": "json_file"}
+                        else:
+                            data = {"success": False, "error": "not_found"}
+                except Exception as e:
+                    data = {"success": False, "error": str(e)}
+        finally:
+            loop.close()
+        return {"tool": "read_file", "data": data}
+    if body.name == "analyze_code":
+        # Use preview/analyze logic (mock code analyzer)
+        try:
+            file_path = str(body.arguments.get("file_path", ""))
+            res = preview_analyze(file_path, None)  # type: ignore[arg-type]
+            return {"tool": "analyze_code", "data": res}
+        except Exception as e:
+            return {"tool": "analyze_code", "error": str(e)}
+    if body.name == "get_system_status":
+        # Aggregate basic status for UI diagnostics
+        try:
+            return {
+                "tool": "get_system_status",
+                "instance": build_identity(),
+                "components": _components_snapshot(),
+            }
+        except Exception as e:
+            return {"tool": "get_system_status", "error": str(e)}
     return {"content": [{"type": "text", "text": f"Executed {body.name} with {body.arguments}"}]}
 
 

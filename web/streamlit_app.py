@@ -465,6 +465,82 @@ def page_tools():
             st.error(str(e))
 
 
+def page_memory():
+    st.header("Memory")
+    st.caption("Browse database contents, preview items, run tools, and ingest files.")
+
+    # Controls
+    colA, colB, colC = st.columns([1,1,2])
+    with colA:
+        limit = st.number_input("List limit", min_value=1, max_value=200, value=20, step=1)
+    with colB:
+        if st.button("Refresh list", use_container_width=True):
+            st.session_state["_mem_refresh"] = time.time()
+
+    # List documents (list_files equivalent)
+    code, docs = _api_get(f"/memory/documents?limit={int(limit)}")
+    if code >= 200 and isinstance(docs, dict):
+        st.success(f"Documents: {docs.get('total_documents', 0)} (showing up to {limit})")
+        rows = docs.get("documents", [])
+        if rows:
+            for d in rows:
+                with st.expander(f"id={d.get('id')} • source={d.get('source')} • created={d.get('created_at')}"):
+                    st.markdown("**Preview**")
+                    st.write(d.get("content") or "(no preview)")
+        else:
+            st.info("No documents found.")
+    else:
+        st.error("Failed to fetch documents. Ensure API is reachable and key is set.")
+
+    st.divider()
+    st.subheader("Tools")
+    tcol1, tcol2, tcol3 = st.columns(3)
+    with tcol1:
+        if st.button("list_files", use_container_width=True):
+            c, data = _api_get(f"/memory/documents?limit={int(limit)}")
+            st.code(json.dumps(data if isinstance(data, dict) else {"raw": data}, indent=2))
+    with tcol2:
+        sel_id = st.text_input("read_file → doc id", value="1")
+        if st.button("read_file", use_container_width=True):
+            # Minimal read: refetch and filter by id
+            c, data = _api_get(f"/memory/documents?limit=200")
+            if c >= 200 and isinstance(data, dict):
+                found = next((x for x in data.get("documents", []) if str(x.get("id")) == str(sel_id)), None)
+                if found:
+                    st.success("Document:")
+                    st.json(found)
+                else:
+                    st.warning("Not found")
+            else:
+                st.error("Failed to read document")
+    with tcol3:
+        path_hint = st.text_input("analyze_code → file path (mock)", value="/app/src/example.py")
+        if st.button("analyze_code", use_container_width=True):
+            c, data = _api_get(f"/preview/analyze?file_path={path_hint}")
+            st.code(json.dumps(data if isinstance(data, dict) else {"raw": data}, indent=2))
+
+    st.divider()
+    st.subheader("Ingest Files")
+    uploaded = st.file_uploader("Upload file(s)", type=[
+        "md","txt","json","csv","yaml","yml","html","pdf","docx","png","jpg","jpeg","bmp","tiff"
+    ], accept_multiple_files=True, key="mem_uploader")
+    src = st.text_input("Source tag", value="ui-upload", key="mem_src")
+    if uploaded and st.button("Ingest to Memory", type="primary", key="mem_ingest_btn"):
+        import requests
+        try:
+            secret_key = (st.secrets.get("DEMO_API_KEY") if hasattr(st, "secrets") else None)
+            headers = {"X-API-Key": secret_key or os.getenv("DEMO_API_KEY", "demo_key_123")}
+            files = [("files", (f.name, f.getvalue(), "application/octet-stream")) for f in uploaded]
+            resp = requests.post(f"{API_BASE}/ingest/files", headers=headers, files=files, data={"source": src}, timeout=180)
+            if resp.ok:
+                st.success(f"Ingested {resp.json().get('stored',0)} file(s); errors={resp.json().get('errors',0)}")
+                st.json(resp.json())
+            else:
+                st.error(f"Ingest failed: {resp.status_code}")
+                st.text(resp.text)
+        except Exception as e:
+            st.error(str(e))
+
 def main():
     st.set_page_config(page_title="Agent Demo UI", layout="wide")
     with st.sidebar:
@@ -484,7 +560,7 @@ def main():
                 st.session_state.pop("LLM_KEY", None)
                 st.info("Cleared")
         st.divider()
-        page = st.radio("Navigate", ["Chat", "Reports", "Suggestions", "Layers", "Mesh", "Health", "Tools/APIs"], index=0)
+        page = st.radio("Navigate", ["Chat", "Reports", "Suggestions", "Layers", "Mesh", "Health", "Tools/APIs", "Memory"], index=0)
 
     if page == "Chat":
         page_chat()
@@ -498,8 +574,10 @@ def main():
         page_mesh()
     elif page == "Health":
         page_health()
-    else:
+    elif page == "Tools/APIs":
         page_tools()
+    else:
+        page_memory()
 
 
 if __name__ == "__main__":

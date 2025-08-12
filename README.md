@@ -1,106 +1,151 @@
-# 7-Agent Layers Demo — Self Development Session (LLM + RAG + Memory)
+## Overview
 
-This repository hosts a focused demonstration of a 7-layer agent architecture with an emphasis on self-development sessions, retrieval-augmented generation (RAG), and long-term memory.
+This repository implements a 7-layer agent system with an operational FastAPI backend, Streamlit UI, Smart Scout automated tests, PostgreSQL (pgvector) memory, and Ollama LLM integration. The system supports instance identity, smart ping/tracing, tool-enabled chat, document ingestion, and RAG.
 
 Repository: [Kausiukas/capstone_project_demo1](https://github.com/Kausiukas/capstone_project_demo1)
 
-## Quick Start
+## Architecture (Mermaid)
+
+```mermaid
+graph LR
+  U["User"] --- S["Streamlit UI (web/streamlit_app.py)"]
+  S ---|HTTP| A["FastAPI Backend (api/main.py)"]
+  A ---|Embeddings| O["Ollama (llama3.2:3b, mxbai-embed-large)"]
+  A ---|pgvector| P["PostgreSQL (langflow-postgres)"]
+  A --- I["Identity + Health + Tools"]
+  S -.-> SM["Smart Ping Page"]
+  U -->|Commands/Chat| S
+```
+
+## Critical Data Flow (Mermaid)
+
+```mermaid
+sequenceDiagram
+  participant UI as Streamlit UI
+  participant API as FastAPI
+  participant OLL as Ollama
+  participant DB as PostgreSQL+pgvector
+  UI->>API: /ingest/files or /memory/store
+  API->>OLL: /api/embeddings (mxbai-embed-large)
+  OLL-->>API: embedding vector (1024-d)
+  API->>DB: INSERT content + embedding (vector_store)
+  UI->>API: /memory/query?query=...
+  API->>DB: SELECT top-k by similarity/text
+  DB-->>API: snippets
+  API-->>UI: answer + used_docs
+```
+
+## Quick Start (local)
 
 ```bash
-# Install dependencies
 pip install -r requirements.txt
-
-# Run the self-development session demo
-python scripts/self_dev_session.py
+streamlit run web/streamlit_app.py --server.port 8501
 ```
 
-Artifacts and logs are stored under `results/` (e.g., `results/chat_sessions/`).
+Backend (Docker):
 
-## Repository Layout
-
-- `7_agent_layers/`
-  - `LVL_1` … `LVL_7`: Each layer includes `layer#.md`, `runbook.md`, `tasklist.md`, `mesh.md`, and `health_checks.md` (plus layer-specific docs).
-  - Cross-layer docs: `file_map.md`, `mesh_map.md`, `directory_requirements.md`, `readme.txt`.
-- `scripts/`
-  - `self_dev_session.py`: Orchestrates a guided self-development iteration across layers.
-  - `health_probe.py`: Lightweight environment/health probe.
-- `results/`
-  - `chat_sessions/.gitkeep`, `llm_suggestions/.gitkeep`: Output directories used by runs.
-
-## Layers Overview
-
-The detailed specification for each layer lives alongside the code/docs in `7_agent_layers/LVL_#/`. Use the `layer#.md` documents for the authoritative design and behaviors.
-
-- Layer 1 — Human Interface
-  - Spec: `7_agent_layers/LVL_1/layer1.md`
-  - Companion docs: `tasklist.md`, `runbook.md`, `mesh.md`, `health_checks.md`.
-- Layer 2 — Information Gathering & Context
-  - Spec: `7_agent_layers/LVL_2/layer2.md`
-  - Companion docs as above.
-- Layer 3 — Structure, Goals & Behaviors
-  - Spec: `7_agent_layers/LVL_3/layer3.md`
-  - Goals: `7_agent_layers/LVL_3/goals.md`, `7_agent_layers/LVL_3/goals.yaml`.
-- Layer 4 — Agent Brain (Reasoning & Planning)
-  - Spec: `7_agent_layers/LVL_4/layer4.md`.
-- Layer 5 — Tools & API Layer
-  - Spec: `7_agent_layers/LVL_5/layer5.md`, `7_agent_layers/LVL_5/self_dev_session.md` (if present).
-- Layer 6 — Memory & Feedback
-  - Spec: `7_agent_layers/LVL_6/layer6.md`.
-- Layer 7 — Infrastructure, Scaling & Security
-  - Spec: `7_agent_layers/LVL_7/layer7.md`.
-
-Complementary cross-layer maps:
-- `7_agent_layers/file_map.md` — file-level catalog
-- `7_agent_layers/mesh_map.md` — interfaces and data flows
-- `7_agent_layers/directory_requirements.md` — required structure
-
-## Self-Development Session
-
-`scripts/self_dev_session.py` drives a structured iteration where the agent reflects on goals, evaluates current capabilities, proposes improvements, and records outcomes. Expected outputs include session logs and updated artifacts in `results/`.
-
-Run:
 ```bash
-python scripts/self_dev_session.py
+docker compose up -d --build api
+# Ensure api container can reach ollama and postgres (bridge network)
 ```
 
-You can run multiple sessions and compare outputs to track capability growth over time.
+Key environment variables:
+- API_KEY: demo_key_123
+- LLM_PROVIDER: ollama
+- OLLAMA_BASE: http://<ollama_host_or_ip>:11434
+- OLLAMA_CHAT_MODEL: llama3.2:3b
+- OLLAMA_EMBED_MODEL: mxbai-embed-large
+- DATABASE_URL: postgresql://langflow_user:langflow_password@<db_host_or_ip>:5432/langflow_connect
 
-## LLM + RAG
+## Endpoints (highlights)
 
-The demo is designed to integrate with an LLM backend and a vector store for retrieval-augmented generation:
+- Identity/Health:
+  - GET `/identity`
+  - GET `/health`
+- Memory:
+  - POST `/memory/store` (StoreBody: user_input, response)
+  - GET `/memory/query?query=...&k=5`
+  - GET `/memory/documents?limit=20`
+- Ingestion:
+  - POST `/ingest/files` (multipart form)
+- Chat:
+  - POST `/chat/message` (session_id, message, top_k)
+  - POST `/chat/stream`
+- Tools:
+  - GET `/tools/list`
+  - POST `/api/v1/tools/call`
 
-- Embeddings + vector store: pluggable; typical setups use PostgreSQL + pgvector
-- Retriever: semantic search over long-term memory
-- Generator: LLM completes tasks using retrieved context
+## Tool-Enabled Chat
 
-Configure provider credentials and endpoints via environment variables as appropriate for your LLM stack (e.g., `OPENAI_API_KEY` or compatible provider keys).
+Chat can execute tools automatically or on explicit commands:
 
-## Long-term Memory
+- List documents (explicit):
+  - `!list_docs 20`
+- Natural language trigger:
+  - “what files/documents are present in the database?”
 
-Long-term memory is backed by a vector store. Common configuration:
+Response includes a concise list plus the full data payload. Works in `/chat/message` and `/chat/stream`.
 
-- Database connection string via `DATABASE_URL`, e.g.
-  - `postgresql://USER:PASS@HOST:PORT/DBNAME`
-- Vector extension: `pgvector` (if using PostgreSQL)
+## Smart Scout (Mesh-aware)
 
-While this repository focuses on the layered demo and session flow, it is compatible with a pgvector-backed memory if you supply a reachable database and embeddings provider.
+Run full readiness test and generate report:
 
-## Connect to a Dockerized API
-
-If you run a separate, containerized API that provides LLM/RAG services:
-
-1. Start your API as usual (e.g., `docker compose up -d`).
-2. Ensure it’s reachable from your machine (e.g., `http://localhost:8000`).
-3. Provide its base URL to your scripts or environment, e.g.:
-   - Set `API_URL` (or equivalent expected by your stack):
 ```bash
-     set API_URL=http://localhost:8000
+python scripts/run_mesh_scout.py
 ```
-   - Or pass as an argument if your wrapper supports it.
 
-If your API exposes vector operations, also set `DATABASE_URL` to point at your vector DB instance.
+Output: `results/scout_reports/scout_report_<timestamp>.json`
+
+## Layer 6 (Memory) Mesh (Mermaid)
+
+```mermaid
+graph TD
+  A["/memory/store"] --> E["Embed via Ollama"]
+  E --> VS["vector_store (pgvector)"]
+  Q["/memory/query"] --> VS
+  VS --> R["snippets"]
+  R --> G["LLM Generate"]
+```
+
+## LangGraph Sketch (illustrative)
+
+```python
+from langgraph.graph import Graph
+
+g = Graph()
+g.add_node("ingest")
+g.add_node("embed")
+g.add_node("store")
+g.add_node("retrieve")
+g.add_node("generate")
+
+g.add_edge("ingest", "embed")
+g.add_edge("embed", "store")
+g.add_edge("retrieve", "generate")
+
+# In practice map nodes to your concrete functions/endpoints
+```
+
+## Troubleshooting
+
+- Ollama 404/connection: ensure models are pulled (`mxbai-embed-large`, `llama3.2:3b`) and API can reach the ollama host/IP.
+- DB auth/role errors: confirm container env (`POSTGRES_USER=langflow_user`, etc.) and `DATABASE_URL` points to the actual service (avoid host.docker.internal unless intended).
+- DNS issues between containers: connect `capstone_api` to the `bridge` network or use service IPs.
+
+## Streamlit Cloud Notes
+
+- Include `requirements.txt` with `streamlit`, `requests` and any client-side deps.
+- Ensure the app entry is `web/streamlit_app.py` (or adjust).
+- API URL and key should be set via Streamlit secrets or environment.
+
+## Repository Layout (selected)
+
+- `api/main.py`: FastAPI backend (identity, memory, tools, chat)
+- `web/streamlit_app.py`: Streamlit UI
+- `scripts/run_mesh_scout.py`: Mesh-aware Smart Scout launcher
+- `scripts/test_critical_postgresql_embeddings.py`: critical store/retrieve tests
+- `7_agent_layers/`: design specs, maps, and diagrams per layer
 
 ## License
 
 MIT License
-

@@ -502,17 +502,12 @@ def page_memory():
     with tcol2:
         sel_id = st.text_input("read_file → doc id", value="1")
         if st.button("read_file", use_container_width=True):
-            # Minimal read: refetch and filter by id
-            c, data = _api_get(f"/memory/documents?limit=200")
-            if c >= 200 and isinstance(data, dict):
-                found = next((x for x in data.get("documents", []) if str(x.get("id")) == str(sel_id)), None)
-                if found:
-                    st.success("Document:")
-                    st.json(found)
-                else:
-                    st.warning("Not found")
+            c, data = _api_get(f"/memory/document/{sel_id}")
+            if c >= 200 and isinstance(data, dict) and data.get("success"):
+                st.success("Document:")
+                st.json(data.get("document", {}))
             else:
-                st.error("Failed to read document")
+                st.warning("Not found")
     with tcol3:
         path_hint = st.text_input("analyze_code → file path (mock)", value="/app/src/example.py")
         if st.button("analyze_code", use_container_width=True):

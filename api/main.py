@@ -276,6 +276,7 @@ EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))
 # Simple PostgreSQL memory system
 import asyncpg
 from typing import List, Dict, Any
+import re
 
 # Import Interaction class
 try:
@@ -322,18 +323,29 @@ class SimplePostgreSQLMemory:
                 await self.initialize()
             
             async with self._pool.acquire() as conn:
-                # Simple text search for now
-                results = await conn.fetch(
-                    """
-                    SELECT id, source, content, created_at 
-                    FROM vector_store 
-                    WHERE content ILIKE $1 OR source ILIKE $1
-                    ORDER BY created_at DESC 
-                    LIMIT $2
-                    """,
-                    f"%{query}%", k
-                )
-                
+                # Attempt search on content and source
+                async def _run(q: str) -> List[asyncpg.Record]:
+                    return await conn.fetch(
+                        """
+                        SELECT id, source, content, created_at 
+                        FROM vector_store 
+                        WHERE content ILIKE $1 OR source ILIKE $1
+                        ORDER BY created_at DESC 
+                        LIMIT $2
+                        """,
+                        f"%{q}%", k
+                    )
+
+                results = await _run(query)
+                # Filename normalization fallback: .txt <-> .md
+                if not results:
+                    if re.search(r"\.txt$", query, flags=re.IGNORECASE):
+                        alt = re.sub(r"\.txt$", ".md", query, flags=re.IGNORECASE)
+                        results = await _run(alt)
+                    elif re.search(r"\.md$", query, flags=re.IGNORECASE):
+                        alt = re.sub(r"\.md$", ".txt", query, flags=re.IGNORECASE)
+                        results = await _run(alt)
+
                 return [
                     {
                         "id": str(r["id"]),
@@ -429,7 +441,10 @@ class SimplePostgreSQLMemory:
                     VALUES ($1, $2, $3)
                     RETURNING id
                     """,
-                    getattr(interaction, 'source', 'unknown'),
+                    (
+                        (getattr(interaction, 'metadata', {}).get('filename') if getattr(interaction, 'metadata', None) else None)
+                        or getattr(interaction, 'source', 'unknown')
+                    ),
                     f"{interaction.user_input}\n{interaction.response}",
                     datetime.now()
                 )
@@ -1171,17 +1186,20 @@ async def memory_store(body: StoreBody, _: None = Depends(require_api_key), llm_
                 
                 # Store in PostgreSQL
                 try:
-                        # Preserve original filename in content if provided via metadata
-                        result = await mem_system.store_interaction(interaction, embedding)
+                    # Preserve original filename in content if provided via metadata
+                    result = await mem_system.store_interaction(interaction, embedding)
                     if result.get("success"):
                         return {
                             "success": True,
                             "message": "Stored in PostgreSQL vector database",
                             "record_id": result.get("record_id"),
-                            "type": "postgresql_pgvector"
+                            "type": "postgresql_pgvector",
                         }
                     else:
-                        return {"success": False, "error": f"PostgreSQL storage failed: {result.get('error')}"}
+                        return {
+                            "success": False,
+                            "error": f"PostgreSQL storage failed: {result.get('error')}",
+                        }
                 except Exception as e:
                     return {"success": False, "error": f"PostgreSQL operation failed: {e}"}
                 
@@ -1367,6 +1385,49 @@ def preview_supported_types(_: None = Depends(require_api_key)) -> Dict[str, Any
 
 class BatchBody(BaseModel):
     file_paths: List[str]
+
+
+# ---------------------------
+# Admin: backfill source from content
+# ---------------------------
+@app.post("/admin/backfill_sources")
+async def admin_backfill_sources(_: None = Depends(require_api_key)) -> Dict[str, Any]:
+    """Backfill `source` with filename if it is embedded in the content.
+
+    Helps older records where original filename wasn't stored in `source`.
+    Looks for a prefix like `upload:<name>` or `[filename: <name>]`.
+    """
+    try:
+        mem_system = await _get_simple_memory_system()
+        if not mem_system:
+            return {"success": False, "error": "Memory system not available"}
+
+        if not mem_system._pool:
+            await mem_system.initialize()
+
+        updated = 0
+        async with mem_system._pool.acquire() as conn:  # type: ignore[attr-defined]
+            rows = await conn.fetch(
+                """
+                SELECT id, source, content FROM vector_store
+                ORDER BY id DESC LIMIT 2000
+                """
+            )
+            for r in rows:
+                src = r["source"] or ""
+                if src and src != "unknown":
+                    continue
+                content = r["content"] or ""
+                m = re.search(r"\[filename:\s*([^\]\n]+)\]", content)
+                if not m:
+                    m = re.search(r"upload:([^\s]+)", content)
+                if m:
+                    filename = m.group(1).strip()
+                    await conn.execute("UPDATE vector_store SET source=$1 WHERE id=$2", filename, r["id"])
+                    updated += 1
+        return {"success": True, "updated": updated}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 @app.post("/preview/batch")

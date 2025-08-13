@@ -3,6 +3,7 @@
 This repository implements a 7-layer agent system with an operational FastAPI backend, Streamlit UI, Smart Scout automated tests, PostgreSQL (pgvector) memory, and Ollama LLM integration. The system supports instance identity, smart ping/tracing, tool-enabled chat, document ingestion, and RAG.
 
 Repository: [Kausiukas/capstone_project_demo1](https://github.com/Kausiukas/capstone_project_demo1)
+**--->>> quck test Demo**: https://capstoneprojectdemo1.streamlit.app/
 
 ## Architecture (Mermaid)
 
@@ -149,3 +150,4 @@ g.add_edge("retrieve", "generate")
 ## License
 
 MIT License
+

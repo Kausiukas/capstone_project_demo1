@@ -146,6 +146,58 @@ g.add_edge("retrieve", "generate")
 - `scripts/test_critical_postgresql_embeddings.py`: critical store/retrieve tests
 - `7_agent_layers/`: design specs, maps, and diagrams per layer
 
+## Seven-Layer Architecture Overview
+
+### Layers at a glance
+- **Layer 1 – Human Interface (95%)**: Streamlit dashboard (tool testing, content preview, performance, topology, API docs). Chat (stream + history), semantic search, file ingestion.
+- **Layer 2 – Information Gathering (90%)**: Collectors (files/HTTP/system), normalizers, context synthesis, validators. AI‑enhanced ingestion with local Ollama and pgvector indexing.
+- **Layer 3 – Structure, Goals & Behaviors (75%)**: Goal management and website optimization signals; local resource learning; personality/ethics scaffolding.
+- **Layer 4 – Agent Brain (45%)**: LLM adapter (Ollama + mock) implemented; reasoning, planning, decision stubs and flows defined.
+- **Layer 5 – Tools & API (75%)**: Tool registry, orchestrator, execution engine; MCP tools (ping/read/list/status/analyze); security and metrics.
+- **Layer 6 – Memory & Feedback (85%)**: pgvector memory, short‑term window + autosummary, feedback‑weighted ranking, chat history, endpoints.
+- **Layer 7 – Infra, Scaling & Security (80%)**: Docker/Compose (API, Postgres+pgvector, Ollama), health checks, API keys & headers, monitoring; deployment paths.
+
+### System diagram (Mermaid)
+```mermaid
+graph TB
+  U[User] --> L1[Layer 1 UI]
+  L1 --> API[FastAPI Backend]
+
+  subgraph Core (L2-L6)
+    L2[Info Gathering] --> DB[(PostgreSQL + pgvector)]
+    L6[Memory & Feedback] --> DB
+    L5[Tools & API] --> MCP[MCP Tools]
+    L4[Agent Brain] --> L5
+    L4 --> L6
+    L2 --> L6
+  end
+
+  API --> L2
+  API --> L4
+  API --> L5
+  API --> L6
+  API --> MON[Monitoring]
+  API --> OLL[Ollama]
+
+  L7[Infra & Security] -. manages .- API
+  L7 -. manages .- DB
+  L7 -. manages .- OLL
+  L7 -. monitors .- MON
+```
+
+### Representative use cases
+- Chat with memory using local models (streaming + history; feedback tunes retrieval)
+- Document ingestion and semantic search (enhanced extraction + structured storage)
+- Code/repo analysis via tools (read, list, analyze) from the dashboard
+- Operational visibility: metrics, health checks, topology, warmup/walkthrough scripts
+
+### Near‑term roadmap
+- L4 Reasoning/Planning: evidence‑tracked chain‑of‑thought, plan validation, cost/latency‑aware decisions
+- L5 Orchestration: DAG/parallel flows, result aggregation, budget policies
+- L6 Consolidation/Learning: nightly consolidate/summarize, HNSW, learning analytics
+- L7 Security/Scaling: token‑bucket rate limits, key rotation, autoscaling, SLOs/error budgets
+- L1 UI/UX: voice I/O, multilingual UI, accessibility
+
 ## License
 
 MIT License

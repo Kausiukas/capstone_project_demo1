@@ -9,9 +9,11 @@ import platform
 import json as _json
 import asyncio
 from datetime import datetime
+import logging
 
 import numpy as np
 import requests
+import aiohttp
 from fastapi import Depends, FastAPI, Header, HTTPException, UploadFile, File, Form, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +34,10 @@ except ImportError:
     MemorySystem = None
 
 API_KEY_ENV = os.getenv("API_KEY", "demo_key_123")
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 def require_api_key(x_api_key: Optional[str] = Header(None)) -> None:
@@ -311,10 +317,101 @@ class SimplePostgreSQLMemory:
                 max_size=5,
                 command_timeout=15
             )
+            
+            # Create chat_history table if it doesn't exist
+            await self._create_chat_history_table()
+            
+            # Create main schema including vector_store table
+            await self._create_schema()
+            
             return True
         except Exception as e:
             print(f"Failed to initialize PostgreSQL pool: {e}")
             return False
+    
+    async def _create_chat_history_table(self):
+        """Create chat_history table if it doesn't exist"""
+        try:
+            async with self._pool.acquire() as conn:
+                # Create chat history table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS chat_history (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        session_id VARCHAR(255) NOT NULL,
+                        user_message TEXT NOT NULL,
+                        assistant_response TEXT NOT NULL,
+                        context_docs JSONB DEFAULT '[]',
+                        used_docs INTEGER DEFAULT 0,
+                        metadata JSONB DEFAULT '{}',
+                        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                        response_time_ms INTEGER,
+                        model_used VARCHAR(100),
+                        streamed BOOLEAN DEFAULT FALSE
+                    )
+                """)
+                
+                # Create indexes
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_chat_history_session_id 
+                    ON chat_history (session_id)
+                """)
+                
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_chat_history_created_at 
+                    ON chat_history (created_at)
+                """)
+                
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_chat_history_session_created 
+                    ON chat_history (session_id, created_at)
+                """)
+                
+                print("Chat history table and indexes created successfully")
+                
+        except Exception as e:
+            print(f"Failed to create chat history table: {e}")
+    
+    async def _create_schema(self):
+        """Create the main database schema including vector_store table"""
+        try:
+            async with self._pool.acquire() as conn:
+                # Enable pgvector extension
+                await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                
+                # Create vector_store table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS vector_store (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        source VARCHAR(500) NOT NULL,
+                        content TEXT NOT NULL,
+                        embedding vector(1024),
+                        metadata JSONB DEFAULT '{}',
+                        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                    )
+                """)
+                
+                # Create indexes for vector_store
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_vector_store_source 
+                    ON vector_store (source)
+                """)
+                
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_vector_store_created_at 
+                    ON vector_store (created_at)
+                """)
+                
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_vector_store_embedding 
+                    ON vector_store USING ivfflat (embedding vector_cosine_ops)
+                    WITH (lists = 100)
+                """)
+                
+                print("Vector store table and indexes created successfully")
+                
+        except Exception as e:
+            print(f"Failed to create vector store schema: {e}")
     
     async def query_similar(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
         """Simple text-based search (fallback when embeddings not available)"""
@@ -358,6 +455,117 @@ class SimplePostgreSQLMemory:
         except Exception as e:
             print(f"PostgreSQL query failed: {e}")
             return []
+    
+    async def query_similar_with_embedding(self, query: str, embedding: List[float], k: int = 5) -> Dict[str, Any]:
+        """Semantic search using embeddings (for chat system)"""
+        try:
+            if not self._pool:
+                await self.initialize()
+            
+            async with self._pool.acquire() as conn:
+                # Extract meaningful search terms from the query
+                search_terms = self._extract_search_terms(query)
+                
+                # Try each search term
+                results = []
+                for term in search_terms:
+                    if not term.strip():
+                        continue
+                    
+                    term_results = await conn.fetch(
+                        """
+                        SELECT id, source, content, created_at 
+                        FROM vector_store 
+                        WHERE content ILIKE $1 OR source ILIKE $1
+                        ORDER BY created_at DESC 
+                        LIMIT $2
+                        """,
+                        f"%{term}%", k
+                    )
+                    
+                    # Add unique results
+                    for r in term_results:
+                        if not any(existing["id"] == str(r["id"]) for existing in results):
+                            results.append(r)
+                    
+                    if len(results) >= k:
+                        break
+                
+                # Filename normalization fallback for specific file queries
+                if not results and any(term.lower().endswith(('.txt', '.md', '.py', '.js')) for term in search_terms):
+                    for term in search_terms:
+                        if term.lower().endswith('.txt'):
+                            alt = term[:-4] + '.md'
+                            alt_results = await conn.fetch(
+                                """
+                                SELECT id, source, content, created_at 
+                                FROM vector_store 
+                                WHERE content ILIKE $1 OR source ILIKE $1
+                                ORDER BY created_at DESC 
+                                LIMIT $2
+                                """,
+                                f"%{alt}%", k
+                            )
+                            results.extend(alt_results)
+                        elif term.lower().endswith('.md'):
+                            alt = term[:-3] + '.txt'
+                            alt_results = await conn.fetch(
+                                """
+                                SELECT id, source, content, created_at 
+                                FROM vector_store 
+                                WHERE content ILIKE $1 OR source ILIKE $1
+                                ORDER BY created_at DESC 
+                                LIMIT $2
+                                """,
+                                f"%{alt}%", k
+                            )
+                            results.extend(alt_results)
+                
+                # Limit results and format
+                results = results[:k]
+                snippets = []
+                for r in results:
+                    content = r["content"] or ""
+                    # Create a preview (first 200 chars)
+                    preview = content[:200] + "..." if len(content) > 200 else content
+                    snippets.append({
+                        "id": str(r["id"]),
+                        "source": r["source"],
+                        "content": content,
+                        "preview": preview,
+                        "created_at": r["created_at"].isoformat() if r["created_at"] else None
+                    })
+                
+                return {
+                    "success": True,
+                    "snippets": snippets,
+                    "total_found": len(snippets)
+                }
+                
+        except Exception as e:
+            print(f"PostgreSQL semantic query failed: {e}")
+            return {"success": False, "snippets": [], "total_found": 0}
+    
+    def _extract_search_terms(self, query: str) -> List[str]:
+        """Extract meaningful search terms from a user query"""
+        # Remove common question words and extract key terms
+        question_words = {
+            'what', 'where', 'when', 'who', 'why', 'how', 'tell', 'me', 'about', 'the', 'a', 'an',
+            'is', 'are', 'was', 'were', 'do', 'does', 'did', 'can', 'could', 'would', 'should',
+            'file', 'files', 'document', 'documents', 'show', 'list', 'find', 'search'
+        }
+        
+        # Split query into words and filter
+        words = query.lower().split()
+        terms = [word for word in words if word not in question_words and len(word) > 2]
+        
+        # Add original query as fallback
+        if terms:
+            terms.append(query)
+        else:
+            terms = [query]
+        
+        return terms
     
     async def get_document_count(self) -> int:
         """Get total document count"""
@@ -452,6 +660,235 @@ class SimplePostgreSQLMemory:
         except Exception as e:
             print(f"Failed to store interaction in PostgreSQL: {e}")
             return {"success": False, "error": str(e)}
+
+    async def store_chat_history(self, session_id: str, user_message: str, 
+                                assistant_response: str, context_docs: List[Dict[str, Any]] = None,
+                                used_docs: int = 0, metadata: Dict[str, Any] = None,
+                                response_time_ms: int = None, model_used: str = None,
+                                streamed: bool = False) -> Dict[str, Any]:
+        """Store chat conversation in the database"""
+        try:
+            if not self._pool:
+                await self.initialize()
+            
+            async with self._pool.acquire() as conn:
+                # Store chat history
+                result = await conn.fetchrow("""
+                    INSERT INTO chat_history 
+                    (session_id, user_message, assistant_response, context_docs, used_docs, 
+                     metadata, response_time_ms, model_used, streamed)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    RETURNING id, created_at
+                """, session_id, user_message, assistant_response, 
+                     json.dumps(context_docs or []), used_docs,
+                     json.dumps(metadata or {}), response_time_ms, model_used, streamed)
+                
+                return {
+                    "success": True,
+                    "chat_id": str(result['id']),
+                    "created_at": result['created_at'].isoformat(),
+                    "session_id": session_id
+                }
+                
+        except Exception as e:
+            print(f"Failed to store chat history: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+    async def get_chat_history(self, session_id: str = None, limit: int = 50, 
+                              offset: int = 0, include_context: bool = False) -> Dict[str, Any]:
+        """Retrieve chat history from the database"""
+        try:
+            if not self._pool:
+                await self.initialize()
+            
+            async with self._pool.acquire() as conn:
+                # Build query based on parameters
+                if session_id:
+                    # Get chat history for specific session
+                    query = """
+                        SELECT id, session_id, user_message, assistant_response, 
+                               context_docs, used_docs, metadata, created_at, 
+                               response_time_ms, model_used, streamed
+                        FROM chat_history 
+                        WHERE session_id = $1
+                        ORDER BY created_at DESC
+                        LIMIT $2 OFFSET $3
+                    """
+                    params = [session_id, limit, offset]
+                else:
+                    # Get all chat history
+                    query = """
+                        SELECT id, session_id, user_message, assistant_response, 
+                               context_docs, used_docs, metadata, created_at, 
+                               response_time_ms, model_used, streamed
+                        FROM chat_history 
+                        ORDER BY created_at DESC
+                        LIMIT $1 OFFSET $2
+                    """
+                    params = [limit, offset]
+                
+                # Execute query
+                rows = await conn.fetch(query, *params)
+                
+                # Get total count for pagination
+                if session_id:
+                    total_count = await conn.fetchval(
+                        "SELECT COUNT(*) FROM chat_history WHERE session_id = $1",
+                        session_id
+                    )
+                else:
+                    total_count = await conn.fetchval("SELECT COUNT(*) FROM chat_history")
+                
+                # Process results
+                chats = []
+                for row in rows:
+                    chat = {
+                        "id": str(row['id']),
+                        "session_id": row['session_id'],
+                        "user_message": row['user_message'],
+                        "assistant_response": row['assistant_response'],
+                        "used_docs": row['used_docs'],
+                        "created_at": row['created_at'].isoformat(),
+                        "response_time_ms": row['response_time_ms'],
+                        "model_used": row['model_used'],
+                        "streamed": row['streamed']
+                    }
+                    
+                    if include_context:
+                        chat["context_docs"] = row['context_docs']
+                        chat["metadata"] = row['metadata']
+                    
+                    chats.append(chat)
+                
+                return {
+                    "success": True,
+                    "chats": chats,
+                    "total_count": total_count,
+                    "limit": limit,
+                    "offset": offset,
+                    "has_more": (offset + limit) < total_count
+                }
+                
+        except Exception as e:
+            print(f"Failed to retrieve chat history: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+    async def get_session_summary(self, session_id: str) -> Dict[str, Any]:
+        """Get a summary of a chat session"""
+        try:
+            if not self._pool:
+                await self.initialize()
+            
+            async with self._pool.acquire() as conn:
+                # Get session statistics
+                stats = await conn.fetchrow("""
+                    SELECT 
+                        COUNT(*) as total_messages,
+                        MIN(created_at) as first_message,
+                        MAX(created_at) as last_message,
+                        AVG(response_time_ms) as avg_response_time,
+                        SUM(used_docs) as total_docs_used,
+                        COUNT(CASE WHEN streamed = true THEN 1 END) as streamed_messages
+                    FROM chat_history 
+                    WHERE session_id = $1
+                """, session_id)
+                
+                if not stats:
+                    return {
+                        "success": False,
+                        "error": "Session not found"
+                    }
+                
+                # Get recent messages for context
+                recent_messages = await conn.fetch("""
+                    SELECT user_message, assistant_response, created_at
+                    FROM chat_history 
+                    WHERE session_id = $1
+                    ORDER BY created_at DESC
+                    LIMIT 5
+                """, session_id)
+                
+                return {
+                    "success": True,
+                    "session_id": session_id,
+                    "statistics": {
+                        "total_messages": stats['total_messages'],
+                        "first_message": stats['first_message'].isoformat() if stats['first_message'] else None,
+                        "last_message": stats['last_message'].isoformat() if stats['last_message'] else None,
+                        "avg_response_time_ms": round(stats['avg_response_time'], 2) if stats['avg_response_time'] else None,
+                        "total_docs_used": stats['total_docs_used'],
+                        "streamed_messages": stats['streamed_messages']
+                    },
+                    "recent_messages": [
+                        {
+                            "user_message": msg['user_message'][:100] + "..." if len(msg['user_message']) > 100 else msg['user_message'],
+                            "assistant_response": msg['assistant_response'][:100] + "..." if len(msg['assistant_response']) > 100 else msg['assistant_response'],
+                            "created_at": msg['created_at'].isoformat()
+                        }
+                        for msg in recent_messages
+                    ]
+                }
+                
+        except Exception as e:
+            print(f"Failed to get session summary: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+    async def get_health_status(self) -> Dict[str, Any]:
+        """Get health status of the memory system"""
+        try:
+            if not self._pool:
+                await self.initialize()
+            
+            async with self._pool.acquire() as conn:
+                # Check if tables exist
+                tables_check = await conn.fetch("""
+                    SELECT table_name 
+                    FROM information_schema.tables 
+                    WHERE table_schema = 'public' 
+                    AND table_name IN ('vector_store', 'chat_history')
+                """)
+                
+                existing_tables = [row['table_name'] for row in tables_check]
+                
+                # Check document counts
+                vector_count = await conn.fetchval("SELECT COUNT(*) FROM vector_store")
+                chat_count = await conn.fetchval("SELECT COUNT(*) FROM chat_history")
+                
+                # Check pgvector extension
+                extension_check = await conn.fetchval("""
+                    SELECT 1 FROM pg_extension WHERE extname = 'vector'
+                """)
+                
+                return {
+                    "status": "healthy" if self._pool and len(existing_tables) >= 2 else "unhealthy",
+                    "connection_pool": "available" if self._pool else "unavailable",
+                    "tables": {
+                        "vector_store": "vector_store" in existing_tables,
+                        "chat_history": "chat_history" in existing_tables
+                    },
+                    "pgvector_extension": bool(extension_check),
+                    "document_counts": {
+                        "vector_store": vector_count,
+                        "chat_history": chat_count
+                    },
+                    "timestamp": datetime.now().isoformat()
+                }
+                
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": str(e),
+                "timestamp": datetime.now().isoformat()
+            }
 
 # Global memory system instance
 _simple_memory_system: Optional[SimplePostgreSQLMemory] = None
@@ -844,7 +1281,7 @@ async def chat_message(body: ChatMessage, _: None = Depends(require_api_key), ll
             if query_embedding:
                 # Query PostgreSQL
                 try:
-                    result = await mem_system.query_similar(body.message, query_embedding, k=body.top_k)
+                    result = await mem_system.query_similar_with_embedding(body.message, query_embedding, k=body.top_k)
                     if result.get("success"):
                         contexts = result.get("snippets", [])
                 except Exception as e:
@@ -889,6 +1326,23 @@ async def chat_message(body: ChatMessage, _: None = Depends(require_api_key), ll
                 timeout=600,
             )
             answer = (data.get("response") or "").strip()
+            
+            # Store chat history
+            try:
+                if mem_system:
+                    await mem_system.store_chat_history(
+                        session_id=body.session_id,
+                        user_message=body.message,
+                        assistant_response=answer,
+                        context_docs=contexts,
+                        used_docs=len(contexts),
+                        metadata={"model": OLLAMA_CHAT_MODEL, "provider": "ollama"},
+                        streamed=False
+                    )
+            except Exception as e:
+                # Log error but don't fail the chat
+                print(f"Failed to store chat history: {e}")
+            
             return {"answer": answer, "used_docs": len(contexts)}
         except Exception as e:
             return {"answer": f"[ollama error] {e}"}
@@ -896,13 +1350,49 @@ async def chat_message(body: ChatMessage, _: None = Depends(require_api_key), ll
     # OpenAI path
     client = _get_openai_client(llm_key)
     if client is None:
-        return {"answer": f"[mock] LLM answer to: {body.message}"}
+        answer = f"[mock] LLM answer to: {body.message}"
+        
+        # Store chat history for mock responses too
+        try:
+            if mem_system:
+                await mem_system.store_chat_history(
+                    session_id=body.session_id,
+                    user_message=body.message,
+                    assistant_response=answer,
+                    context_docs=contexts,
+                    used_docs=len(contexts),
+                    metadata={"model": "mock", "provider": "mock"},
+                    streamed=False
+                )
+        except Exception as e:
+            # Log error but don't fail the chat
+            print(f"Failed to store chat history: {e}")
+        
+        return {"answer": answer, "used_docs": len(contexts)}
+    
     res = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
         temperature=0.3,
     )
     answer = (res.choices[0].message.content or "").strip()
+    
+    # Store chat history
+    try:
+        if mem_system:
+            await mem_system.store_chat_history(
+                session_id=body.session_id,
+                user_message=body.message,
+                assistant_response=answer,
+                context_docs=contexts,
+                used_docs=len(contexts),
+                metadata={"model": CHAT_MODEL, "provider": "openai"},
+                streamed=False
+            )
+    except Exception as e:
+        # Log error but don't fail the chat
+        print(f"Failed to store chat history: {e}")
+    
     return {"answer": answer, "used_docs": len(contexts)}
 
 
@@ -946,7 +1436,7 @@ async def chat_stream(body: ChatMessage, _: None = Depends(require_api_key), llm
             if query_embedding:
                 # Query PostgreSQL
                 try:
-                    result = await mem_system.query_similar(body.message, query_embedding, k=body.top_k)
+                    result = await mem_system.query_similar_with_embedding(body.message, query_embedding, k=body.top_k)
                     if result.get("success"):
                         contexts = result.get("snippets", [])
                 except Exception as e:
@@ -980,6 +1470,7 @@ async def chat_stream(body: ChatMessage, _: None = Depends(require_api_key), llm
     def _stream_ollama():
         import datetime
         last = time.time()
+        full_response = ""
         try:
             # Use generate streaming
             url = f"{OLLAMA_BASE}/api/generate"
@@ -1008,24 +1499,45 @@ async def chat_stream(body: ChatMessage, _: None = Depends(require_api_key), llm
                         obj = json.loads(line)
                         chunk = (obj.get("response") or "")
                         if chunk:
+                            full_response += chunk
                             yield chunk
                             last = now
                         if obj.get("done"):
                             break
                     except Exception:
                         yield " \n"
+                
+                # Store chat history after streaming is complete
+                try:
+                    if mem_system and full_response.strip():
+                        # Chat history will be stored by the wrapper function
+                        pass
+                except Exception as e:
+                    print(f"Failed to store streamed chat history: {e}")
+                    
         except Exception as e:
             yield f"[stream error] {e}"
 
     def _stream_openai():
         last = time.time()
+        full_response = ""
         if client is None:
             # mock stream with small chunks
             txt = f"[mock] LLM answer to: {body.message}"
             for ch in txt:
+                full_response += ch
                 yield ch
                 time.sleep(0.01)
+            
+            # Store chat history for mock responses
+            try:
+                if mem_system:
+                    # Chat history will be stored by the wrapper function
+                    pass
+            except Exception as e:
+                print(f"Failed to store mock streamed chat history: {e}")
             return
+            
         try:
             stream = client.chat.completions.create(
                 model=CHAT_MODEL,
@@ -1038,16 +1550,50 @@ async def chat_stream(body: ChatMessage, _: None = Depends(require_api_key), llm
                 if hasattr(ev, "choices") and ev.choices:
                     delta = ev.choices[0].delta.content or ""
                     if delta:
+                        full_response += delta
                         yield delta
                         last = now
                 if now - last > 8:
                     yield " \n"
                     last = now
+            
+            # Store chat history after streaming is complete
+            try:
+                if mem_system and full_response.strip():
+                    # Chat history will be stored by the wrapper function
+                    pass
+            except Exception as e:
+                print(f"Failed to store streamed chat history: {e}")
+                
         except Exception as e:
             yield f"[stream error] {e}"
 
     generator = _stream_ollama if LLM_PROVIDER == "ollama" else _stream_openai
-    return StreamingResponse(generator(), media_type="text/plain; charset=utf-8")
+    
+    # Create a wrapper generator that captures the full response and stores it
+    async def _stream_with_history():
+        full_response = ""
+        try:
+            for chunk in generator():
+                full_response += chunk
+                yield chunk
+        finally:
+            # Store chat history after streaming is complete
+            try:
+                if mem_system and full_response.strip():
+                    await mem_system.store_chat_history(
+                        session_id=body.session_id,
+                        user_message=body.message,
+                        assistant_response=full_response.strip(),
+                        context_docs=contexts,
+                        used_docs=len(contexts),
+                        metadata={"model": OLLAMA_CHAT_MODEL if LLM_PROVIDER == "ollama" else CHAT_MODEL, "provider": LLM_PROVIDER},
+                        streamed=True
+                    )
+            except Exception as e:
+                print(f"Failed to store streamed chat history: {e}")
+    
+    return StreamingResponse(_stream_with_history(), media_type="text/plain; charset=utf-8")
 
 class RunSessionBody(BaseModel):
     duration_min: int = 2
@@ -1647,6 +2193,356 @@ async def ingest_files(
             details.append({"file": uf.filename, "ok": False, "error": str(e)})
     
     return IngestResponse(stored=stored, errors=errs, details=details)
+
+
+# Chat History Endpoints
+@app.get("/chat/history")
+async def chat_history(session_id: str = Query(None, description="Session ID to filter by"), 
+                      limit: int = Query(50, description="Maximum number of records to return", ge=1, le=100),
+                      offset: int = Query(0, description="Number of records to skip", ge=0),
+                      include_context: bool = Query(False, description="Include context documents"),
+                      _: None = Depends(require_api_key)) -> Dict[str, Any]:
+    """Get chat history from the database"""
+    try:
+        mem_system = await _get_simple_memory_system()
+        if mem_system:
+            result = await mem_system.get_chat_history(
+                session_id=session_id,
+                limit=limit,
+                offset=offset,
+                include_context=include_context
+            )
+            return result
+        else:
+            return {
+                "success": False,
+                "error": "Memory system not available"
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@app.get("/chat/history/{session_id}")
+async def chat_history_by_session(session_id: str,
+                                limit: int = Query(50, description="Maximum number of records to return", ge=1, le=100),
+                                offset: int = Query(0, description="Number of records to skip", ge=0),
+                                include_context: bool = Query(False, description="Include context documents"),
+                                _: None = Depends(require_api_key)) -> Dict[str, Any]:
+    """Get chat history for a specific session"""
+    try:
+        mem_system = await _get_simple_memory_system()
+        if mem_system:
+            result = await mem_system.get_chat_history(
+                session_id=session_id,
+                limit=limit,
+                offset=offset,
+                include_context=include_context
+            )
+            return result
+        else:
+            return {
+                "success": False,
+                "error": "Memory system not available"
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@app.get("/chat/session/{session_id}/summary")
+async def chat_session_summary(session_id: str,
+                             _: None = Depends(require_api_key)) -> Dict[str, Any]:
+    """Get a summary of a chat session"""
+    try:
+        mem_system = await _get_simple_memory_system()
+        if mem_system:
+            result = await mem_system.get_session_summary(session_id)
+            return result
+        else:
+            return {
+                "success": False,
+                "error": "Memory system not available"
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@app.get("/chat/sessions")
+async def list_chat_sessions(limit: int = Query(20, description="Maximum number of sessions to return", ge=1, le=100),
+                           offset: int = Query(0, description="Number of sessions to skip", ge=0),
+                           _: None = Depends(require_api_key)) -> Dict[str, Any]:
+    """List all available chat sessions"""
+    try:
+        mem_system = await _get_simple_memory_system()
+        if mem_system:
+            # Get all chat history to extract unique sessions
+            result = await mem_system.get_chat_history(limit=1000, offset=0)
+            if not result.get("success"):
+                return result
+            
+            # Extract unique sessions
+            sessions = {}
+            for chat in result.get("chats", []):
+                session_id = chat["session_id"]
+                if session_id not in sessions:
+                    sessions[session_id] = {
+                        "session_id": session_id,
+                        "first_message": chat["created_at"],
+                        "last_message": chat["created_at"],
+                        "message_count": 0,
+                        "total_docs_used": 0,
+                        "streamed_messages": 0
+                    }
+                
+                sessions[session_id]["message_count"] += 1
+                sessions[session_id]["total_docs_used"] += chat["used_docs"]
+                if chat["streamed"]:
+                    sessions[session_id]["streamed_messages"] += 1
+                
+                # Update timestamps
+                if chat["created_at"] < sessions[session_id]["first_message"]:
+                    sessions[session_id]["first_message"] = chat["created_at"]
+                if chat["created_at"] > sessions[session_id]["last_message"]:
+                    sessions[session_id]["last_message"] = chat["created_at"]
+            
+            # Convert to list and sort by last message
+            session_list = list(sessions.values())
+            session_list.sort(key=lambda x: x["last_message"], reverse=True)
+            
+            # Apply pagination
+            total_sessions = len(session_list)
+            paginated_sessions = session_list[offset:offset + limit]
+            
+            return {
+                "success": True,
+                "sessions": paginated_sessions,
+                "total_count": total_sessions,
+                "limit": limit,
+                "offset": offset,
+                "has_more": (offset + limit) < total_sessions
+            }
+        else:
+            return {
+                "success": False,
+                "error": "Memory system not available"
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+# Add enhanced ingestion imports
+from local_enhanced_ingestion import LocalEnhancedIngestionEngine
+from enhanced_storage import EnhancedStorageEngine
+
+# Add enhanced ingestion endpoints
+@app.post("/ingest/enhanced")
+async def ingest_file_enhanced(
+    file: UploadFile,
+    extraction_options: Dict[str, Any] = None,
+    _: None = Depends(require_api_key)
+) -> Dict[str, Any]:
+    """Enhanced file ingestion using local Ollama models"""
+    
+    try:
+        # Get memory system
+        mem_system = await _get_simple_memory_system()
+        if not mem_system:
+            return {
+                "success": False,
+                "error": "Memory system not available"
+            }
+        
+        # Save uploaded file temporarily
+        temp_file_path = f"temp_uploads/{file.filename}"
+        os.makedirs("temp_uploads", exist_ok=True)
+        
+        with open(temp_file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        # Initialize enhanced ingestion engine
+        async with LocalEnhancedIngestionEngine(
+            ollama_base_url=OLLAMA_BASE,
+            current_system=mem_system
+        ) as engine:
+            
+            # Process file with enhanced ingestion
+            ingestion_results = await engine.ingest_file_enhanced(
+                temp_file_path,
+                file_type=file.filename.split('.')[-1] if '.' in file.filename else None,
+                extraction_options=extraction_options
+            )
+            
+            # Store results using enhanced storage
+            storage_engine = EnhancedStorageEngine(
+                current_memory_system=mem_system,
+                database_url=os.getenv("DATABASE_URL")
+            )
+            
+            storage_results = await storage_engine.store_document_enhanced(
+                ingestion_results
+            )
+            
+            # Clean up temp file
+            try:
+                os.remove(temp_file_path)
+            except:
+                pass
+            
+            return {
+                "success": True,
+                "ingestion": ingestion_results,
+                "storage": storage_results,
+                "file_info": {
+                    "filename": file.filename,
+                    "size_bytes": len(content),
+                    "content_type": file.content_type
+                }
+            }
+    
+    except Exception as e:
+        logger.error(f"Enhanced ingestion failed: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+@app.post("/ingest/enhanced/batch")
+async def ingest_files_enhanced_batch(
+    files: List[UploadFile],
+    extraction_options: Dict[str, Any] = None,
+    _: None = Depends(require_api_key)
+) -> Dict[str, Any]:
+    """Batch enhanced file ingestion"""
+    
+    try:
+        results = []
+        
+        for file in files:
+            # Process each file individually
+            file_result = await ingest_file_enhanced(file, extraction_options, _)
+            results.append({
+                "filename": file.filename,
+                "result": file_result
+            })
+        
+        # Generate batch summary
+        successful = sum(1 for r in results if r["result"]["success"])
+        failed = len(results) - successful
+        
+        return {
+            "success": True,
+            "batch_summary": {
+                "total_files": len(files),
+                "successful": successful,
+                "failed": failed
+            },
+            "results": results
+        }
+    
+    except Exception as e:
+        logger.error(f"Batch enhanced ingestion failed: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+@app.get("/ingest/enhanced/status")
+async def get_enhanced_ingestion_status(
+    _: None = Depends(require_api_key)
+) -> Dict[str, Any]:
+    """Get status of enhanced ingestion system"""
+    
+    try:
+        # Check Ollama availability
+        ollama_health = await check_ollama_health()
+        
+        # Check current system availability
+        current_system_health = await check_current_system_health()
+        
+        return {
+            "success": True,
+            "enhanced_ingestion": {
+                "status": "available" if ollama_health["healthy"] else "unavailable",
+                "ollama_models": ollama_health.get("models", []),
+                "ollama_endpoint": OLLAMA_BASE
+            },
+            "current_system": {
+                "status": "available" if current_system_health["healthy"] else "unavailable",
+                "health": current_system_health
+            },
+            "fallback_available": True,  # Always available
+            "hybrid_capabilities": {
+                "structured_extraction": True,
+                "entity_recognition": True,
+                "document_analysis": True,
+                "multi_format_support": True
+            }
+        }
+    
+    except Exception as e:
+        logger.error(f"Failed to get enhanced ingestion status: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+async def check_ollama_health() -> Dict[str, Any]:
+    """Check Ollama service health"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{OLLAMA_BASE}/api/tags", timeout=5) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    models = [model["name"] for model in data.get("models", [])]
+                    return {
+                        "healthy": True,
+                        "models": models,
+                        "endpoint": OLLAMA_BASE
+                    }
+                else:
+                    return {
+                        "healthy": False,
+                        "error": f"HTTP {response.status}",
+                        "endpoint": OLLAMA_BASE
+                    }
+    except Exception as e:
+        return {
+            "healthy": False,
+            "error": str(e),
+            "endpoint": OLLAMA_BASE
+        }
+
+async def check_current_system_health() -> Dict[str, Any]:
+    """Check current memory system health"""
+    try:
+        mem_system = await _get_simple_memory_system()
+        if mem_system:
+            health = await mem_system.get_health_status()
+            return {
+                "healthy": health.get("status") == "healthy",
+                "details": health
+            }
+        else:
+            return {
+                "healthy": False,
+                "error": "Memory system not initialized"
+            }
+    except Exception as e:
+        return {
+            "healthy": False,
+            "error": str(e)
+        }
 
 
 
